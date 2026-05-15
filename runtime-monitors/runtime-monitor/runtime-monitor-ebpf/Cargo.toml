@@ -1,0 +1,17 @@
+[package]
+name = "runtime-monitor-ebpf"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+runtime-monitor-common = { path = "../runtime-monitor-common" }
+
+aya-ebpf = { workspace = true }
+aya-log-ebpf = { workspace = true }
+
+[build-dependencies]
+which = { workspace = true }
+
+[[bin]]
+name = "runtime-monitor"
+path = "src/main.rs"
