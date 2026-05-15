@@ -1,0 +1,15 @@
+name: fyp-fastapi-echo
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: fastapi-echo
+    ports:
+      - "8000:8000"
+    labels:
+      fyp.workload: "fastapi-echo"
+    environment:
+      PYTHONUNBUFFERED: "1"
+    restart: unless-stopped
