@@ -409,6 +409,8 @@ dependencies = [
  "log",
  "runtime-monitor-common",
  "runtime-monitor-ebpf",
+ "serde",
+ "serde_json",
  "tokio",
 ]
 
@@ -428,6 +430,15 @@ dependencies = [
  "aya-log-ebpf",
  "runtime-monitor-common",
  "which",
+]
+
+[[package]]
+name = "runtime-verifier"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

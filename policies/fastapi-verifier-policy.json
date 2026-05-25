@@ -1,0 +1,13 @@
+{
+    "workload_id": "fastapi-echo",
+    "allowed_exec_paths": [
+        "/usr/local/bin/python",
+        "/usr/bin/echo"
+    ],
+    "forbidden_exec_paths": [
+        "/usr/bin/id",
+        "/bin/sh",
+        "/bin/bash"
+    ],
+    "default_action": "deny"
+}

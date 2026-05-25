@@ -1,0 +1,6 @@
+{
+  "workload_id": "fastapi-echo",
+  "container_name": "fastapi-echo",
+  "scope": "workload",
+  "evidence_out": "logs/runtime_events.jsonl"
+}

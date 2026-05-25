@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["runtime-monitor", "runtime-monitor-common", "runtime-monitor-ebpf"]
+members = [
+    "runtime-monitor",
+    "runtime-monitor-common",
+    "runtime-monitor-ebpf",
+    "runtime-verifier",
+]
 default-members = ["runtime-monitor", "runtime-monitor-common"]
 
 [workspace.package]
@@ -27,6 +32,8 @@ tokio = { version = "1.40.0", features = ["time"] }
 which = { version = "8.0.2", default-features = false }
 
 bytemuck = { version = "1.14.0", features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
 
 [profile.release.package.runtime-monitor-ebpf]
 debug = 2
