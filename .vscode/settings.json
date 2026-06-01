@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.linkedProjects": [
+        "/home/astrobyte/imperial/fyp/runtime-custodian/runtime-monitors/runtime-monitor/Cargo.toml"
+    ]
+}

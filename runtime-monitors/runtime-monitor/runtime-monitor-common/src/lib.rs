@@ -3,8 +3,11 @@
 use bytemuck::{Pod, Zeroable};
 
 pub const TASK_COMM_LEN: usize = 16;
-pub const PATH_LEN: usize = 256;
+pub const PATH_LEN: usize = 512;
 pub const FILENAME_TRUNCATED: u32 = 1;
+pub const COLLECTION_MODE_SCOPED: u32 = 0;
+pub const COLLECTION_MODE_HOST_WIDE: u32 = 1;
+pub const UNKNOWN_WORKLOAD_INDEX: u32 = u32::MAX;
 
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -23,9 +26,33 @@ pub struct TargetWorkload {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TargetWorkload {}
 
+// Must match the kernel `struct bpf_spin_lock`; used only inside BPF map values.
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct BpfSpinLock {
+    pub val: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Pod, Zeroable)]
+pub struct MonitorState {
+    pub lock: BpfSpinLock,
+    pub reserved: u32,
+    pub seq: u64,
+    pub lost: u64,
+}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for BpfSpinLock {}
+
+#[cfg(feature = "user")]
+unsafe impl aya::Pod for MonitorState {}
+
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct Event {
+    pub seq: u64,
+    pub lost: u64,
     pub ts_ns: u64,
     pub cgroup_id: u64,
 

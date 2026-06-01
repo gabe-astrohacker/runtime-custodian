@@ -1,0 +1,44 @@
+[workspace]
+resolver = "2"
+members = [
+    "runtime-monitors/runtime-monitor/runtime-monitor",
+    "runtime-monitors/runtime-monitor/runtime-monitor-common",
+    "runtime-monitors/runtime-monitor/runtime-monitor-ebpf",
+    "runtime-monitors/runtime-monitor/runtime-verifier",
+    "runtime-watcher",
+]
+default-members = [
+    "runtime-monitors/runtime-monitor/runtime-monitor",
+    "runtime-monitors/runtime-monitor/runtime-monitor-common",
+    "runtime-monitors/runtime-monitor/runtime-verifier",
+]
+
+[workspace.package]
+license = "MIT OR Apache-2.0"
+edition = "2024"
+
+[workspace.dependencies]
+aya = { git = "https://github.com/aya-rs/aya", rev = "4940ee6c69196634de9bf2f3c434cb5a57f194e5", default-features = false }
+aya-build = { git = "https://github.com/aya-rs/aya", rev = "4940ee6c69196634de9bf2f3c434cb5a57f194e5", default-features = false }
+aya-ebpf = { git = "https://github.com/aya-rs/aya", rev = "4940ee6c69196634de9bf2f3c434cb5a57f194e5", default-features = false }
+aya-log = { git = "https://github.com/aya-rs/aya", rev = "4940ee6c69196634de9bf2f3c434cb5a57f194e5", default-features = false }
+aya-log-ebpf = { git = "https://github.com/aya-rs/aya", rev = "4940ee6c69196634de9bf2f3c434cb5a57f194e5", default-features = false }
+
+anyhow = { version = "1", default-features = false }
+cargo_metadata = { version = "0.23.0", default-features = false }
+clap = { version = "4.5.20", default-features = false, features = ["std"] }
+env_logger = { version = "0.11.5", default-features = false }
+libc = { version = "0.2.186", default-features = false }
+log = { version = "0.4.22", default-features = false }
+tokio = { version = "1.40.0", features = ["time"] }
+which = { version = "8.0.2", default-features = false }
+
+bytemuck = { version = "1.14.0", features = ["derive"] }
+serde = { version = "1", default-features = false, features = ["std"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", default-features = false }
+
+[profile.release.package.runtime-monitor-ebpf]
+debug = 2
+codegen-units = 1
+strip = false
