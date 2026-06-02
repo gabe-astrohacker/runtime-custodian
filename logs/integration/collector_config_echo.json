@@ -1,6 +1,0 @@
-{
-  "collection_mode": "scoped",
-  "container_name": "fastapi-echo",
-  "evidence_out": "/home/astrobyte/imperial/fyp/runtime-custodian/logs/integration/runtime_events_echo.jsonl",
-  "workload_id": "fastapi-echo"
-}

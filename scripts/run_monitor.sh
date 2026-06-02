@@ -2,6 +2,8 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-WORKSPACE="$ROOT/runtime-monitors/runtime-monitor"
+MONITOR_BIN="${MONITOR_BIN:-$ROOT/target/debug/runtime-monitor}"
+COLLECTOR_CONFIG="${COLLECTOR_CONFIG:-$ROOT/policies/fastapi-monitor-policy.json}"
+SUDO="${SUDO:-sudo}"
 
-sudo "$WORKSPACE/target/debug/runtime-monitor" --collector-config "$ROOT/policies/fastapi-monitor-policy.json"
+exec $SUDO "$MONITOR_BIN" --collector-config "$COLLECTOR_CONFIG"

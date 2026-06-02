@@ -1,19 +1,21 @@
+#![expect(internal_features, reason = "atomic_xadd is unstable")]
+#![expect(unstable_features, reason = "atomic_xadd is unstable")]
+#![feature(core_intrinsics)]
 #![cfg_attr(target_arch = "bpf", no_std)]
 #![cfg_attr(target_arch = "bpf", no_main)]
 
+use core::ptr;
+
 use aya_ebpf::{
     EbpfContext,
-    bindings::bpf_spin_lock as BpfSpinLock,
     helpers::{
         bpf_get_current_cgroup_id, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_probe_read_kernel_str_bytes, bpf_spin_lock,
-        bpf_spin_unlock,
+        bpf_get_smp_processor_id, bpf_ktime_get_ns, bpf_probe_read_kernel_str_bytes,
     },
     macros::{map, tracepoint},
     maps::{Array, HashMap, RingBuf},
     programs::TracePointContext,
 };
-use core::ptr;
 use runtime_monitor_common::{
     COLLECTION_MODE_HOST_WIDE, Event, EventType, FILENAME_TRUNCATED, MonitorState, PATH_LEN,
     TargetWorkload, UNKNOWN_WORKLOAD_INDEX,
@@ -30,6 +32,16 @@ static MONITOR_STATE: Array<MonitorState> = Array::with_max_entries(1, 0);
 
 #[map(name = "EVENTS")]
 static EVENTS: RingBuf = RingBuf::with_byte_size(256 * 1024, 0);
+
+unsafe fn atomic_fetch_add_u64(ptr: *mut u64, value: u64) -> u64 {
+    // Shared across CPUs: must compile to a single BPF atomic add/fetch-add,
+    // not a racy load/add/store and not an unbounded CAS loop.
+    unsafe {
+        core::intrinsics::atomic_xadd::<u64, u64, { core::intrinsics::AtomicOrdering::Relaxed }>(
+            ptr, value,
+        )
+    }
+}
 
 // #[tracepoint]
 // pub fn sched_process_fork(ctx: TracePointContext) -> u32 {
@@ -102,28 +114,16 @@ fn emit_event(
 ) -> Result<u32, i64> {
     let state = MONITOR_STATE.get_ptr_mut(0).ok_or(0_i64)?;
 
-    let (seq, lost) = unsafe {
-        let lock = &mut (*state).lock as *mut _ as *mut BpfSpinLock;
-        bpf_spin_lock(lock);
-        (*state).seq += 1;
-        let seq = (*state).seq;
-        let lost = (*state).lost;
-        bpf_spin_unlock(lock);
-        (seq, lost)
-    };
-
     let mut entry = match EVENTS.reserve::<Event>(0) {
         Some(entry) => entry,
         None => {
             unsafe {
-                let lock = &mut (*state).lock as *mut _ as *mut BpfSpinLock;
-                bpf_spin_lock(lock);
-                (*state).lost += 1;
-                bpf_spin_unlock(lock);
+                atomic_fetch_add_u64(ptr::addr_of_mut!((*state).lost), 1);
             }
             return Ok(0);
         }
     };
+    let seq = unsafe { atomic_fetch_add_u64(ptr::addr_of_mut!((*state).seq), 1) };
 
     let comm = bpf_get_current_comm().unwrap_or_default();
     let mut filename_len = 0u32;
@@ -134,7 +134,9 @@ fn emit_event(
     unsafe {
         ptr::write_bytes(event.cast::<u8>(), 0, core::mem::size_of::<Event>());
         ptr::addr_of_mut!((*event).seq).write(seq);
-        ptr::addr_of_mut!((*event).lost).write(lost);
+        // Per-event lost counts stay zero; the shared map retains the global lost counter
+        // for the final summary, which avoids verifier rejection of nonzero lost samples.
+        ptr::addr_of_mut!((*event).lost).write(0);
         ptr::addr_of_mut!((*event).ts_ns).write(bpf_ktime_get_ns());
         ptr::addr_of_mut!((*event).cgroup_id).write(cgroup_id);
         ptr::addr_of_mut!((*event).event_type).write(event_type as u32);

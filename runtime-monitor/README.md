@@ -3,11 +3,18 @@
 ## Prerequisites
 
 1. stable rust toolchains: `rustup toolchain install stable`
-1. nightly rust toolchains: `rustup toolchain install nightly --component rust-src`
+1. pinned nightly for the eBPF crate: `rustup toolchain install nightly-2026-06-02 --component rust-src`
 1. (if cross-compiling) rustup target: `rustup target add ${ARCH}-unknown-linux-musl`
 1. (if cross-compiling) LLVM: (e.g.) `brew install llvm` (on macOS)
 1. (if cross-compiling) C toolchain: (e.g.) [`brew install filosottile/musl-cross/musl-cross`](https://github.com/FiloSottile/homebrew-musl-cross) (on macOS)
 1. bpf-linker: `cargo install bpf-linker` (`--no-default-features` on macOS)
+
+The userspace monitor and verifier remain on stable Rust. Only the eBPF crate uses the pinned
+nightly toolchain because BPF `build-std` and low-level atomic code generation need unstable
+toolchain support.
+
+If you need to change the eBPF toolchain locally, set
+`RUNTIME_MONITOR_EBPF_TOOLCHAIN=nightly-YYYY-MM-DD` before building.
 
 ## Build & Run
 
@@ -19,6 +26,10 @@ cargo run --release
 
 Cargo build scripts are used to automatically build the eBPF correctly and include it in the
 program.
+
+The shared monitor-state counter is now implemented with atomic increments on a single global map
+value. The previous spin-lock-based approach was removed because that helper requires a
+BTF-compatible map value layout and was unnecessary for a single cross-CPU counter.
 
 ## Cross-compiling on macOS
 

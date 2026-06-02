@@ -23,3 +23,8 @@ target
 .github/copilot*
 .github/prompts*
 docs
+__pycache__/
+*.pyc
+logs/integration/
+logs/experiments/
+.codex

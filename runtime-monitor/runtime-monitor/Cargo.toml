@@ -29,7 +29,6 @@ tokio = { workspace = true, features = [
 bytemuck = { workspace = true }
 [build-dependencies]
 anyhow = { workspace = true }
-aya-build = { workspace = true }
 cargo_metadata = { workspace = true }
 # TODO(https://github.com/rust-lang/cargo/issues/12375): this should be an artifact dependency, but
 # it's not possible to tell cargo to use `-Z build-std` to build it. We cargo-in-cargo in the build

@@ -13,10 +13,9 @@ def main():
     parser = argparse.ArgumentParser(description="Summarise runtime evidence JSONL")
     parser.add_argument(
         "evidence",
-        nargs="?",
-        default="logs/runtime_events.jsonl",
-        help="Path to runtime_events.jsonl",
+        help="Path to runtime evidence JSONL, e.g. logs/integration/runtime_events_echo.jsonl",
     )
+
     args = parser.parse_args()
 
     evidence = Path(args.evidence)

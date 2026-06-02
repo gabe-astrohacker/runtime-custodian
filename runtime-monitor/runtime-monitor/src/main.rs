@@ -257,8 +257,6 @@ impl EvidenceCapture {
 
     fn fallback_monitor_state(&self) -> MonitorState {
         MonitorState {
-            lock: runtime_monitor_common::BpfSpinLock { val: 0 },
-            reserved: 0,
             seq: self.event_count as u64,
             lost: self.observed_lost,
         }

@@ -1,16 +1,15 @@
 [workspace]
 resolver = "2"
 members = [
-    "runtime-monitors/runtime-monitor/runtime-monitor",
-    "runtime-monitors/runtime-monitor/runtime-monitor-common",
-    "runtime-monitors/runtime-monitor/runtime-monitor-ebpf",
-    "runtime-monitors/runtime-monitor/runtime-verifier",
-    "runtime-watcher",
+    "runtime-monitor/runtime-monitor",
+    "runtime-monitor/runtime-monitor-common",
+    "runtime-monitor/runtime-monitor-ebpf",
+    "runtime-monitor/runtime-verifier",
 ]
 default-members = [
-    "runtime-monitors/runtime-monitor/runtime-monitor",
-    "runtime-monitors/runtime-monitor/runtime-monitor-common",
-    "runtime-monitors/runtime-monitor/runtime-verifier",
+    "runtime-monitor/runtime-monitor",
+    "runtime-monitor/runtime-monitor-common",
+    "runtime-monitor/runtime-verifier",
 ]
 
 [workspace.package]

@@ -26,24 +26,12 @@ pub struct TargetWorkload {
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for TargetWorkload {}
 
-// Must match the kernel `struct bpf_spin_lock`; used only inside BPF map values.
-#[repr(C)]
-#[derive(Clone, Copy, Pod, Zeroable)]
-pub struct BpfSpinLock {
-    pub val: u32,
-}
-
 #[repr(C)]
 #[derive(Clone, Copy, Pod, Zeroable)]
 pub struct MonitorState {
-    pub lock: BpfSpinLock,
-    pub reserved: u32,
     pub seq: u64,
     pub lost: u64,
 }
-
-#[cfg(feature = "user")]
-unsafe impl aya::Pod for BpfSpinLock {}
 
 #[cfg(feature = "user")]
 unsafe impl aya::Pod for MonitorState {}
