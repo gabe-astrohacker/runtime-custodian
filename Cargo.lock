@@ -466,8 +466,11 @@ dependencies = [
 name = "runtime-monitor-common"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "aya",
  "bytemuck",
+ "serde",
+ "sha2",
 ]
 
 [[package]]

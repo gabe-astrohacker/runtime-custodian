@@ -1,5 +1,8 @@
 #![no_std]
 
+#[cfg(feature = "user")]
+extern crate std;
+
 use bytemuck::{Pod, Zeroable};
 
 pub const TASK_COMM_LEN: usize = 16;
@@ -62,3 +65,15 @@ pub struct Event {
     pub filename: [u8; PATH_LEN],
 }
 // Optional: userspace-only convenience impls can live behind cfg(feature = "user")
+
+#[cfg(feature = "user")]
+pub mod evidence;
+
+#[cfg(feature = "user")]
+pub use evidence::{
+    AcceptablePolicy, AttestationPolicy, ClassificationResult, DeniedPolicy, EventClassification,
+    EvidenceEvent, EvidenceRecord, EvidenceSyntheticRecord, RuntimeEvent, RuntimePolicy,
+    RuntimeSummary, SuspiciousPolicy, SyntheticRecordType, classify_event, event_hash,
+    generate_session_id, hex_decode_32, hex_encode, policy_hash, synthetic_record_hash,
+    update_software_chain,
+};
