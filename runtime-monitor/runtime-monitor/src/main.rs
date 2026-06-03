@@ -22,6 +22,8 @@ use runtime_monitor_common::{
     generate_session_id, hex_encode, policy_hash, synthetic_record_hash,
 };
 
+mod tpm;
+
 #[repr(C)]
 struct CgroupFileHandle {
     handle_bytes: u32,
@@ -74,6 +76,9 @@ struct SingleCollectorConfig {
     evidence_out: String,
     runtime_policy: Option<String>,
     summary_out: Option<String>,
+    tpm_tcti: Option<String>,
+    #[serde(default)]
+    tpm_reset_pcr: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -84,6 +89,9 @@ struct MultiCollectorConfig {
     evidence_out: Option<String>,
     runtime_policy: Option<String>,
     summary_out: Option<String>,
+    tpm_tcti: Option<String>,
+    #[serde(default)]
+    tpm_reset_pcr: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -155,6 +163,19 @@ impl CollectorConfig {
         match self {
             Self::Single(config) => config.summary_out.as_deref(),
             Self::Multi(config) => config.summary_out.as_deref(),
+        }
+    }
+
+    fn tpm_local_options(&self) -> tpm::TpmLocalOptions {
+        match self {
+            Self::Single(config) => tpm::TpmLocalOptions {
+                tcti: config.tpm_tcti.clone(),
+                reset_pcr: config.tpm_reset_pcr,
+            },
+            Self::Multi(config) => tpm::TpmLocalOptions {
+                tcti: config.tpm_tcti.clone(),
+                reset_pcr: config.tpm_reset_pcr,
+            },
         }
     }
 }
@@ -476,6 +497,23 @@ fn validate_collector_config(config: &CollectorConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn log_tpm_config(config: &tpm::TpmConfig) {
+    if !config.enabled {
+        info!("TPM backend disabled");
+        return;
+    }
+
+    let runtime_pcr = config
+        .runtime_pcr
+        .map(|pcr| pcr.to_string())
+        .unwrap_or_else(|| String::from("<none>"));
+    let tcti = config.tcti.as_deref().unwrap_or("<default>");
+    info!(
+        "TPM backend configured for Stage 5 validation only: hash_bank={} runtime_pcr={} reset_pcr={} tcti={} fail_on_tpm_error={}",
+        config.hash_bank, runtime_pcr, config.reset_pcr, tcti, config.fail_on_tpm_error
+    );
 }
 
 fn docker_container_pid(container_name: &str) -> Result<u32> {
@@ -821,6 +859,11 @@ async fn main() -> Result<()> {
         );
         (RuntimePolicy::default(), PolicySource::Defaulted)
     };
+    let tpm_config = tpm::TpmConfig::from_policy_and_local_options(
+        &runtime_policy.attestation,
+        collector_config.tpm_local_options(),
+    )?;
+    log_tpm_config(&tpm_config);
     let mut evidence = EvidenceCapture::new(
         evidence_out,
         summary_out,
@@ -981,6 +1024,29 @@ mod tests {
         let path = default_summary_path_for_evidence(Path::new("logs/runtime_events.jsonl"));
 
         assert_eq!(path, PathBuf::from("logs/runtime_summary.json"));
+    }
+
+    #[test]
+    fn collector_config_parses_local_tpm_options() {
+        let config = serde_json::from_str::<CollectorConfig>(
+            r#"{
+                "workload_id": "workload-a",
+                "container_name": "container-a",
+                "collection_mode": "scoped",
+                "evidence_out": "logs/runtime_events.jsonl",
+                "tpm_tcti": "swtpm:host=localhost,port=2321",
+                "tpm_reset_pcr": true
+            }"#,
+        )
+        .expect("collector config");
+
+        let options = config.tpm_local_options();
+
+        assert_eq!(
+            options.tcti.as_deref(),
+            Some("swtpm:host=localhost,port=2321")
+        );
+        assert!(options.reset_pcr);
     }
 
     fn temp_output_paths(test_name: &str) -> (PathBuf, PathBuf) {
