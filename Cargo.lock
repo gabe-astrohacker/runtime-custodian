@@ -458,7 +458,6 @@ dependencies = [
  "runtime-monitor-ebpf",
  "serde",
  "serde_json",
- "sha2",
  "tokio",
 ]
 
@@ -470,6 +469,7 @@ dependencies = [
  "aya",
  "bytemuck",
  "serde",
+ "serde_json",
  "sha2",
 ]
 
@@ -488,9 +488,9 @@ name = "runtime-verifier"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "runtime-monitor-common",
  "serde",
  "serde_json",
- "sha2",
 ]
 
 [[package]]

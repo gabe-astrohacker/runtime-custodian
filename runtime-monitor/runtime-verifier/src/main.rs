@@ -2,7 +2,8 @@ use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Output};
 
 use runtime_monitor_common::evidence::{RUNTIME_SUMMARY_SCHEMA_VERSION, RuntimeEvidenceState};
 use runtime_monitor_common::{
@@ -21,6 +22,7 @@ struct Args {
     evidence: PathBuf,
     summary: PathBuf,
     report: Option<PathBuf>,
+    require_tpm_quote: bool,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -79,6 +81,7 @@ struct VerificationChecks {
     tpm_metadata_valid: bool,
     tpm_summary_valid: bool,
     tpm_pcr_replay_valid: bool,
+    tpm_quote_valid: bool,
 }
 
 impl VerificationChecks {
@@ -98,6 +101,7 @@ impl VerificationChecks {
             tpm_metadata_valid: true,
             tpm_summary_valid: true,
             tpm_pcr_replay_valid: true,
+            tpm_quote_valid: true,
         }
     }
 
@@ -117,6 +121,7 @@ impl VerificationChecks {
             tpm_metadata_valid: false,
             tpm_summary_valid: false,
             tpm_pcr_replay_valid: false,
+            tpm_quote_valid: false,
         }
     }
 }
@@ -146,11 +151,89 @@ impl VerificationReport {
     }
 }
 
+#[derive(Debug, Clone)]
+struct QuoteVerificationOptions {
+    require_tpm_quote: bool,
+    summary_dir: PathBuf,
+}
+
+impl QuoteVerificationOptions {
+    #[cfg(test)]
+    fn default_for_tests() -> Self {
+        Self {
+            require_tpm_quote: false,
+            summary_dir: PathBuf::from("."),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TpmQuoteCheckRequest {
+    ak_public_path: PathBuf,
+    quote_message_path: PathBuf,
+    quote_signature_path: PathBuf,
+    quote_pcrs_path: PathBuf,
+    nonce_hex: String,
+    pcr_selection: String,
+    hash_algorithm: String,
+}
+
+trait TpmQuoteCheckRunner {
+    fn checkquote(&self, request: &TpmQuoteCheckRequest) -> Result<()>;
+}
+
+struct SystemTpmQuoteCheckRunner;
+
+impl TpmQuoteCheckRunner for SystemTpmQuoteCheckRunner {
+    fn checkquote(&self, request: &TpmQuoteCheckRequest) -> Result<()> {
+        let args = vec![
+            String::from("-u"),
+            path_to_string(&request.ak_public_path, "AK public path")?,
+            String::from("-m"),
+            path_to_string(&request.quote_message_path, "quote message path")?,
+            String::from("-s"),
+            path_to_string(&request.quote_signature_path, "quote signature path")?,
+            String::from("-f"),
+            path_to_string(&request.quote_pcrs_path, "quote PCR path")?,
+            String::from("-l"),
+            request.pcr_selection.clone(),
+            String::from("-q"),
+            request.nonce_hex.clone(),
+            String::from("-g"),
+            request.hash_algorithm.clone(),
+        ];
+        let output = Command::new("tpm2_checkquote")
+            .args(&args)
+            .output()
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    anyhow!("TPM tool `tpm2_checkquote` is not available")
+                } else {
+                    anyhow!("failed to run TPM tool `tpm2_checkquote`: {error}")
+                }
+            })?;
+        validate_command_success("tpm2_checkquote", output)
+    }
+}
+
+#[cfg(test)]
+struct NoopTpmQuoteCheckRunner;
+
+#[cfg(test)]
+impl TpmQuoteCheckRunner for NoopTpmQuoteCheckRunner {
+    fn checkquote(&self, _request: &TpmQuoteCheckRequest) -> Result<()> {
+        Err(anyhow!(
+            "unexpected TPM quote check in test without quote metadata"
+        ))
+    }
+}
+
 fn parse_args() -> Result<Args> {
     let mut policy = None;
     let mut evidence = None;
     let mut summary = None;
     let mut report = None;
+    let mut require_tpm_quote = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
@@ -159,9 +242,10 @@ fn parse_args() -> Result<Args> {
             "--evidence" => evidence = args.next().map(PathBuf::from),
             "--summary" => summary = args.next().map(PathBuf::from),
             "--report" => report = args.next().map(PathBuf::from),
+            "--require-tpm-quote" => require_tpm_quote = true,
             _ => {
                 return Err(anyhow!(
-                    "unknown argument `{arg}`; usage: runtime-verifier --policy <runtime_policy.json> --evidence <runtime_events.jsonl> --summary <runtime_summary.json> [--report <verification_report.json>]"
+                    "unknown argument `{arg}`; usage: runtime-verifier --policy <runtime_policy.json> --evidence <runtime_events.jsonl> --summary <runtime_summary.json> [--report <verification_report.json>] [--require-tpm-quote]"
                 ));
             }
         }
@@ -172,6 +256,7 @@ fn parse_args() -> Result<Args> {
         evidence: evidence.ok_or_else(|| anyhow!("missing --evidence <runtime_events.jsonl>"))?,
         summary: summary.ok_or_else(|| anyhow!("missing --summary <runtime_summary.json>"))?,
         report,
+        require_tpm_quote,
     })
 }
 
@@ -262,14 +347,45 @@ fn verify_from_paths(args: &Args) -> VerificationReport {
         }
     };
 
-    verify_replay(&policy, &summary, &records)
+    let runner = SystemTpmQuoteCheckRunner;
+    verify_replay_with_quote_runner(
+        &policy,
+        &summary,
+        &records,
+        &runner,
+        QuoteVerificationOptions {
+            require_tpm_quote: args.require_tpm_quote,
+            summary_dir: summary_parent_dir(&args.summary),
+        },
+    )
 }
 
+#[cfg(test)]
 fn verify_replay(
     policy: &RuntimePolicy,
     summary: &RuntimeSummary,
     records: &[EvidenceRecord],
 ) -> VerificationReport {
+    let runner = NoopTpmQuoteCheckRunner;
+    verify_replay_with_quote_runner(
+        policy,
+        summary,
+        records,
+        &runner,
+        QuoteVerificationOptions::default_for_tests(),
+    )
+}
+
+fn verify_replay_with_quote_runner<R>(
+    policy: &RuntimePolicy,
+    summary: &RuntimeSummary,
+    records: &[EvidenceRecord],
+    quote_runner: &R,
+    quote_options: QuoteVerificationOptions,
+) -> VerificationReport
+where
+    R: TpmQuoteCheckRunner,
+{
     let mut checks = VerificationChecks::all_valid();
     let mut first_suspicious_event = None;
     let mut first_denied_event = None;
@@ -452,6 +568,8 @@ fn verify_replay(
         expected_policy_hash,
         &state,
         &tpm_event_replay,
+        quote_runner,
+        &quote_options,
         &mut checks,
         &mut structural_reasons,
     );
@@ -862,20 +980,25 @@ fn validate_lifecycle_completeness(
     }
 }
 
-fn validate_tpm_summary(
+fn validate_tpm_summary<R>(
     policy: &RuntimePolicy,
     summary: &RuntimeSummary,
     session_id: [u8; 32],
     policy_hash_bytes: [u8; 32],
     state: &RuntimeEvidenceState,
     tpm_event_replay: &TpmEventReplayState,
+    quote_runner: &R,
+    quote_options: &QuoteVerificationOptions,
     checks: &mut VerificationChecks,
     structural_reasons: &mut Vec<String>,
-) {
+) where
+    R: TpmQuoteCheckRunner,
+{
     let policy_backend = normalized_attestation_backend(policy);
     let policy_uses_tpm = policy_backend == "tpm";
 
     let Some(tpm_summary) = summary.tpm.as_ref() else {
+        validate_missing_tpm_quote(quote_options, checks, structural_reasons);
         if policy_uses_tpm
             && (policy.attestation.fail_on_tpm_error.unwrap_or(true)
                 || !summary_indicates_tpm_failed_open(summary))
@@ -1083,6 +1206,138 @@ fn validate_tpm_summary(
             ));
         }
     }
+
+    validate_tpm_quote_summary(
+        tpm_summary,
+        quote_runner,
+        quote_options,
+        checks,
+        structural_reasons,
+    );
+}
+
+fn validate_missing_tpm_quote(
+    quote_options: &QuoteVerificationOptions,
+    checks: &mut VerificationChecks,
+    structural_reasons: &mut Vec<String>,
+) {
+    if quote_options.require_tpm_quote {
+        checks.tpm_quote_valid = false;
+        structural_reasons.push(String::from(
+            "TPM quote is required but summary.tpm.quote metadata is missing",
+        ));
+    }
+}
+
+fn validate_tpm_quote_summary<R>(
+    tpm_summary: &runtime_monitor_common::TpmSummary,
+    quote_runner: &R,
+    quote_options: &QuoteVerificationOptions,
+    checks: &mut VerificationChecks,
+    structural_reasons: &mut Vec<String>,
+) where
+    R: TpmQuoteCheckRunner,
+{
+    let Some(quote) = tpm_summary.quote.as_ref() else {
+        validate_missing_tpm_quote(quote_options, checks, structural_reasons);
+        return;
+    };
+
+    let nonce_hex = match validate_quote_nonce(&quote.nonce_hex) {
+        Ok(nonce_hex) => Some(nonce_hex),
+        Err(error) => {
+            checks.tpm_quote_valid = false;
+            structural_reasons.push(format!("invalid summary.tpm.quote.nonce_hex: {error}"));
+            None
+        }
+    };
+
+    let expected_pcr_selection = format!("{}:{}", tpm_summary.hash_bank, tpm_summary.runtime_pcr);
+    if quote.pcr_selection != expected_pcr_selection {
+        checks.tpm_quote_valid = false;
+        structural_reasons.push(format!(
+            "TPM quote PCR selection mismatch: expected {} got {}",
+            expected_pcr_selection, quote.pcr_selection
+        ));
+    }
+
+    let quote_message_path = resolve_summary_relative_path(
+        &quote.quote_message_path,
+        "summary.tpm.quote.quote_message_path",
+        quote_options,
+        checks,
+        structural_reasons,
+    );
+    let quote_signature_path = resolve_summary_relative_path(
+        &quote.quote_signature_path,
+        "summary.tpm.quote.quote_signature_path",
+        quote_options,
+        checks,
+        structural_reasons,
+    );
+    let quote_pcrs_path = resolve_summary_relative_path(
+        &quote.quote_pcrs_path,
+        "summary.tpm.quote.quote_pcrs_path",
+        quote_options,
+        checks,
+        structural_reasons,
+    );
+    let ak_public_path = match quote.ak_public_path.as_deref() {
+        Some(path) => resolve_summary_relative_path(
+            path,
+            "summary.tpm.quote.ak_public_path",
+            quote_options,
+            checks,
+            structural_reasons,
+        ),
+        None => {
+            checks.tpm_quote_valid = false;
+            structural_reasons.push(String::from(
+                "summary.tpm.quote.ak_public_path is required when quote metadata is present",
+            ));
+            None
+        }
+    };
+
+    let (
+        Some(nonce_hex),
+        Some(quote_message_path),
+        Some(quote_signature_path),
+        Some(quote_pcrs_path),
+        Some(ak_public_path),
+    ) = (
+        nonce_hex,
+        quote_message_path,
+        quote_signature_path,
+        quote_pcrs_path,
+        ak_public_path,
+    )
+    else {
+        return;
+    };
+
+    let request = TpmQuoteCheckRequest {
+        ak_public_path,
+        quote_message_path,
+        quote_signature_path,
+        quote_pcrs_path,
+        nonce_hex,
+        pcr_selection: quote.pcr_selection.clone(),
+        hash_algorithm: tpm_summary.hash_bank.clone(),
+    };
+
+    // Stage 8 security boundary: tpm2_checkquote validates quote signature,
+    // nonce, and PCR-file consistency against a configured AK public key. It
+    // does not validate that the AK belongs to a certified hardware TPM or
+    // trusted platform; AK/EK trust is deferred to a later Keylime/PKI stage.
+    // tpm2_quote writes a serialized PCR blob by default. Stage 8 relies on
+    // tpm2_checkquote to bind that PCR file to the quote, and on the existing
+    // software PCR replay to validate final_pcr. Parsing the PCR blob directly
+    // is intentionally left for a later hardening pass.
+    if let Err(error) = quote_runner.checkquote(&request) {
+        checks.tpm_quote_valid = false;
+        structural_reasons.push(format!("TPM quote check failed: {error}"));
+    }
 }
 
 fn normalized_attestation_backend(policy: &RuntimePolicy) -> String {
@@ -1180,6 +1435,13 @@ fn summary_indicates_tpm_failed_open(summary: &RuntimeSummary) -> bool {
         .is_some_and(|reason| reason.contains("TPM binding failed open"))
 }
 
+fn summary_indicates_tpm_quote_failed_open(summary: &RuntimeSummary) -> bool {
+    summary
+        .failure_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("TPM quote generation failed open"))
+}
+
 fn tpm_fail_open_software_evidence(policy: &RuntimePolicy, summary: &RuntimeSummary) -> bool {
     normalized_attestation_backend(policy) == "tpm"
         && !policy.attestation.fail_on_tpm_error.unwrap_or(true)
@@ -1216,6 +1478,82 @@ fn decode_tpm_hex_32_field(
             None
         }
     }
+}
+
+fn validate_quote_nonce(value: &str) -> Result<String> {
+    let value = value
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or_else(|| value.trim());
+    if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(anyhow!("expected a 64-character SHA-256 hex nonce"));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn resolve_summary_relative_path(
+    value: &str,
+    label: &str,
+    quote_options: &QuoteVerificationOptions,
+    checks: &mut VerificationChecks,
+    structural_reasons: &mut Vec<String>,
+) -> Option<PathBuf> {
+    match validate_summary_relative_path(value, label) {
+        Ok(path) => Some(quote_options.summary_dir.join(path)),
+        Err(error) => {
+            checks.tpm_quote_valid = false;
+            structural_reasons.push(error.to_string());
+            None
+        }
+    }
+}
+
+fn validate_summary_relative_path(value: &str, label: &str) -> Result<PathBuf> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(anyhow!("{label} must not be empty"));
+    }
+    let path = Path::new(value);
+    if path.is_absolute() {
+        return Err(anyhow!("{label} must be a relative path"));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::ParentDir => {
+                return Err(anyhow!("{label} must not contain `..` components"));
+            }
+            _ => return Err(anyhow!("{label} contains unsupported path components")),
+        }
+    }
+    Ok(path.to_path_buf())
+}
+
+fn path_to_string(path: &Path, label: &str) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{label} is not valid UTF-8: {}", path.display()))
+}
+
+fn validate_command_success(program: &str, output: Output) -> Result<()> {
+    if output.status.success() {
+        return Ok(());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(anyhow!(
+        "TPM tool `{program}` failed with status {}: {}",
+        output.status,
+        stderr.trim()
+    ))
+}
+
+fn summary_parent_dir(summary_path: &Path) -> PathBuf {
+    summary_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn mark_lifecycle_invalid(
@@ -1310,6 +1648,13 @@ fn decision_for_valid_evidence(
         return (
             VerificationDecision::AcceptWithWarnings,
             String::from("TPM binding failed open; software evidence replay passed"),
+        );
+    }
+
+    if summary_indicates_tpm_quote_failed_open(summary) {
+        return (
+            VerificationDecision::AcceptWithWarnings,
+            String::from("TPM quote generation failed open; TPM PCR replay passed"),
         );
     }
 
@@ -1415,10 +1760,48 @@ mod tests {
     use super::*;
     use runtime_monitor_common::evidence::RuntimeEventType;
     use runtime_monitor_common::{
-        AcceptablePolicy, AttestationPolicy, DeniedPolicy, SuspiciousPolicy, TpmSummary,
+        AcceptablePolicy, AttestationPolicy, DeniedPolicy, SuspiciousPolicy, TpmQuoteSummary,
+        TpmSummary,
     };
+    use std::cell::RefCell;
 
     const SESSION_ID: [u8; 32] = [7u8; 32];
+
+    #[derive(Debug)]
+    struct MockQuoteCheckRunner {
+        calls: RefCell<Vec<TpmQuoteCheckRequest>>,
+        fail: bool,
+    }
+
+    impl MockQuoteCheckRunner {
+        fn success() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fail: false,
+            }
+        }
+
+        fn failure() -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                fail: true,
+            }
+        }
+
+        fn calls(&self) -> Vec<TpmQuoteCheckRequest> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl TpmQuoteCheckRunner for MockQuoteCheckRunner {
+        fn checkquote(&self, request: &TpmQuoteCheckRequest) -> Result<()> {
+            self.calls.borrow_mut().push(request.clone());
+            if self.fail {
+                return Err(anyhow!("mock checkquote failure"));
+            }
+            Ok(())
+        }
+    }
 
     fn push_synthetic(
         records: &mut Vec<EvidenceRecord>,
@@ -1653,6 +2036,20 @@ mod tests {
             final_pcr: Some(hex_encode(&final_pcr)),
             session_start_digest: hex_encode(&session_digest),
             final_summary_digest: hex_encode(&final_digest),
+            quote: None,
+        });
+    }
+
+    fn attach_valid_tpm_quote(summary: &mut RuntimeSummary) {
+        summary.tpm.as_mut().expect("tpm").quote = Some(TpmQuoteSummary {
+            nonce_hex: String::from(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            pcr_selection: String::from("sha256:23"),
+            quote_message_path: String::from("tpm_quote/session.quote.msg"),
+            quote_signature_path: String::from("tpm_quote/session.quote.sig"),
+            quote_pcrs_path: String::from("tpm_quote/session.quote.pcrs"),
+            ak_public_path: Some(String::from("tpm_quote/session.akpub.pem")),
         });
     }
 
@@ -1670,6 +2067,28 @@ mod tests {
         summary: &RuntimeSummary,
     ) -> VerificationReport {
         verify_replay(policy, summary, events)
+    }
+
+    fn verify_fixture_with_quote_runner<R>(
+        policy: &RuntimePolicy,
+        events: &[EvidenceRecord],
+        summary: &RuntimeSummary,
+        runner: &R,
+        require_tpm_quote: bool,
+    ) -> VerificationReport
+    where
+        R: TpmQuoteCheckRunner,
+    {
+        verify_replay_with_quote_runner(
+            policy,
+            summary,
+            events,
+            runner,
+            QuoteVerificationOptions {
+                require_tpm_quote,
+                summary_dir: PathBuf::from("/tmp/runtime-summary-dir"),
+            },
+        )
     }
 
     #[test]
@@ -1695,6 +2114,157 @@ mod tests {
         assert_eq!(report.decision, VerificationDecision::Accept);
         assert!(report.checks.tpm_summary_valid);
         assert!(report.checks.tpm_pcr_replay_valid);
+    }
+
+    #[test]
+    fn valid_tpm_quote_metadata_runs_checkquote_and_accepts() {
+        let policy = tpm_policy(Some(true));
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+        attach_valid_tpm_quote(&mut summary);
+        let runner = MockQuoteCheckRunner::success();
+
+        let report = verify_fixture_with_quote_runner(&policy, &events, &summary, &runner, false);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert!(report.checks.tpm_quote_valid);
+        assert_eq!(
+            runner.calls(),
+            vec![TpmQuoteCheckRequest {
+                ak_public_path: PathBuf::from(
+                    "/tmp/runtime-summary-dir/tpm_quote/session.akpub.pem"
+                ),
+                quote_message_path: PathBuf::from(
+                    "/tmp/runtime-summary-dir/tpm_quote/session.quote.msg"
+                ),
+                quote_signature_path: PathBuf::from(
+                    "/tmp/runtime-summary-dir/tpm_quote/session.quote.sig"
+                ),
+                quote_pcrs_path: PathBuf::from(
+                    "/tmp/runtime-summary-dir/tpm_quote/session.quote.pcrs"
+                ),
+                nonce_hex: String::from(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                ),
+                pcr_selection: String::from("sha256:23"),
+                hash_algorithm: String::from("sha256"),
+            }]
+        );
+    }
+
+    #[test]
+    fn tpm_quote_check_failure_is_invalid_evidence() {
+        let policy = tpm_policy(Some(true));
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+        attach_valid_tpm_quote(&mut summary);
+        let runner = MockQuoteCheckRunner::failure();
+
+        let report = verify_fixture_with_quote_runner(&policy, &events, &summary, &runner, false);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_quote_valid);
+        assert!(report.reason.contains("TPM quote check failed"));
+    }
+
+    #[test]
+    fn required_tpm_quote_missing_is_invalid_evidence() {
+        let policy = tpm_policy(Some(true));
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+        let runner = MockQuoteCheckRunner::success();
+
+        let report = verify_fixture_with_quote_runner(&policy, &events, &summary, &runner, true);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_quote_valid);
+        assert!(report.reason.contains("TPM quote is required"));
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn tpm_summary_without_quote_still_accepts_when_quote_not_required() {
+        let policy = tpm_policy(Some(true));
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert!(report.checks.tpm_quote_valid);
+    }
+
+    #[test]
+    fn quote_metadata_rejects_absolute_or_parent_paths() {
+        let policy = tpm_policy(Some(true));
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+        attach_valid_tpm_quote(&mut summary);
+        let quote = summary
+            .tpm
+            .as_mut()
+            .expect("tpm")
+            .quote
+            .as_mut()
+            .expect("quote");
+        quote.quote_message_path = String::from("/tmp/quote.msg");
+        quote.quote_signature_path = String::from("../quote.sig");
+        let runner = MockQuoteCheckRunner::success();
+
+        let report = verify_fixture_with_quote_runner(&policy, &events, &summary, &runner, false);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_quote_valid);
+        assert!(report.reason.contains("relative path"));
+        assert!(report.reason.contains("must not contain `..`"));
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn quote_metadata_rejects_invalid_nonce() {
+        let policy = tpm_policy(Some(true));
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+        attach_valid_tpm_quote(&mut summary);
+        summary
+            .tpm
+            .as_mut()
+            .expect("tpm")
+            .quote
+            .as_mut()
+            .expect("quote")
+            .nonce_hex = String::from("abcd");
+        let runner = MockQuoteCheckRunner::success();
+
+        let report = verify_fixture_with_quote_runner(&policy, &events, &summary, &runner, false);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_quote_valid);
+        assert!(report.reason.contains("nonce_hex"));
+        assert!(runner.calls().is_empty());
+    }
+
+    #[test]
+    fn quote_metadata_rejects_pcr_selection_mismatch() {
+        let policy = tpm_policy(Some(true));
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+        attach_valid_tpm_quote(&mut summary);
+        summary
+            .tpm
+            .as_mut()
+            .expect("tpm")
+            .quote
+            .as_mut()
+            .expect("quote")
+            .pcr_selection = String::from("sha256:22");
+        let runner = MockQuoteCheckRunner::success();
+
+        let report = verify_fixture_with_quote_runner(&policy, &events, &summary, &runner, false);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_quote_valid);
+        assert!(report.reason.contains("PCR selection"));
     }
 
     #[test]

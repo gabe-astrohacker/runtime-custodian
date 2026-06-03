@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Result, anyhow};
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use runtime_monitor_common::{AttestationPolicy, EventClassification};
@@ -32,6 +33,16 @@ pub struct PcrValue {
     pub pcr: u32,
     pub hash_bank: String,
     pub digest_hex: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TpmQuoteRequest {
+    pub ak_context: PathBuf,
+    pub nonce_hex: String,
+    pub pcr_selection: String,
+    pub quote_message_path: PathBuf,
+    pub quote_signature_path: PathBuf,
+    pub quote_pcrs_path: PathBuf,
 }
 
 pub trait TpmCommandRunner {
@@ -113,6 +124,11 @@ impl TpmConfig {
         self.is_policy_triggered() && self.extend_on.contains(&classification)
     }
 
+    pub fn pcr_selection(&self) -> Result<String> {
+        let pcr = self.runtime_pcr_for_command("select PCR")?;
+        Ok(format!("{}:{pcr}", self.hash_bank))
+    }
+
     fn runtime_pcr_for_command(&self, operation: &str) -> Result<u32> {
         self.ensure_enabled(operation)?;
         self.runtime_pcr
@@ -175,6 +191,43 @@ where
     Ok(())
 }
 
+pub fn quote<R>(runner: &R, config: &TpmConfig, request: &TpmQuoteRequest) -> Result<()>
+where
+    R: TpmCommandRunner,
+{
+    config.ensure_enabled("generate quote")?;
+    let expected_pcr_selection = config.pcr_selection()?;
+    if request.pcr_selection != expected_pcr_selection {
+        return Err(anyhow!(
+            "quote PCR selection mismatch: expected {} got {}",
+            expected_pcr_selection,
+            request.pcr_selection
+        ));
+    }
+
+    let nonce_hex = validate_sha256_digest_hex(&request.nonce_hex)?;
+    let args = vec![
+        String::from("-c"),
+        path_to_string(&request.ak_context, "quote AK context")?,
+        String::from("-l"),
+        request.pcr_selection.clone(),
+        String::from("-q"),
+        nonce_hex,
+        String::from("-m"),
+        path_to_string(&request.quote_message_path, "quote message path")?,
+        String::from("-s"),
+        path_to_string(&request.quote_signature_path, "quote signature path")?,
+        String::from("-o"),
+        path_to_string(&request.quote_pcrs_path, "quote PCR path")?,
+        String::from("-F"),
+        String::from("values"),
+        String::from("-g"),
+        config.hash_bank.clone(),
+    ];
+    run_checked(runner, config, "tpm2_quote", args)?;
+    Ok(())
+}
+
 fn run_checked<R>(
     runner: &R,
     config: &TpmConfig,
@@ -199,6 +252,12 @@ where
         ));
     }
     Ok(output)
+}
+
+fn path_to_string(path: &PathBuf, label: &str) -> Result<String> {
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("{label} is not valid UTF-8: {}", path.display()))
 }
 
 fn parse_pcr_read_output(stdout: &[u8], pcr: u32) -> Result<String> {
@@ -597,6 +656,48 @@ mod tests {
     }
 
     #[test]
+    fn quote_uses_expected_command() {
+        let runner = MockRunner::success("");
+        let config = enabled_config();
+        let request = TpmQuoteRequest {
+            ak_context: PathBuf::from("attestation/ak.ctx"),
+            nonce_hex: digest_hex(),
+            pcr_selection: String::from("sha256:23"),
+            quote_message_path: PathBuf::from("tpm_quote/session.quote.msg"),
+            quote_signature_path: PathBuf::from("tpm_quote/session.quote.sig"),
+            quote_pcrs_path: PathBuf::from("tpm_quote/session.quote.pcrs"),
+        };
+
+        quote(&runner, &config, &request).expect("quote");
+
+        assert_eq!(
+            runner.calls(),
+            vec![MockCall {
+                program: String::from("tpm2_quote"),
+                args: vec![
+                    String::from("-c"),
+                    String::from("attestation/ak.ctx"),
+                    String::from("-l"),
+                    String::from("sha256:23"),
+                    String::from("-q"),
+                    digest_hex(),
+                    String::from("-m"),
+                    String::from("tpm_quote/session.quote.msg"),
+                    String::from("-s"),
+                    String::from("tpm_quote/session.quote.sig"),
+                    String::from("-o"),
+                    String::from("tpm_quote/session.quote.pcrs"),
+                    String::from("-F"),
+                    String::from("values"),
+                    String::from("-g"),
+                    String::from("sha256"),
+                ],
+                envs: Vec::new(),
+            }]
+        );
+    }
+
+    #[test]
     fn pcr_read_uses_expected_command_and_parses_digest() {
         let digest = digest_hex();
         let stdout = format!("sha256:\n  23: 0x{digest}\n");
@@ -683,10 +784,19 @@ mod tests {
         )
         .expect("disabled");
         let reset_disabled = enabled_config();
+        let quote_request = TpmQuoteRequest {
+            ak_context: PathBuf::from("attestation/ak.ctx"),
+            nonce_hex: digest_hex(),
+            pcr_selection: String::from("sha256:23"),
+            quote_message_path: PathBuf::from("tpm_quote/session.quote.msg"),
+            quote_signature_path: PathBuf::from("tpm_quote/session.quote.sig"),
+            quote_pcrs_path: PathBuf::from("tpm_quote/session.quote.pcrs"),
+        };
 
         assert!(pcr_extend(&runner, &disabled, &digest_hex()).is_err());
         assert!(pcr_read(&runner, &disabled).is_err());
         assert!(pcr_reset(&runner, &reset_disabled).is_err());
+        assert!(quote(&runner, &disabled, &quote_request).is_err());
         assert!(runner.calls().is_empty());
     }
 

@@ -10,7 +10,7 @@ use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufWriter, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use tokio::signal;
 
@@ -18,9 +18,9 @@ use runtime_monitor_common::evidence::{RUNTIME_SUMMARY_SCHEMA_VERSION, RuntimeEv
 use runtime_monitor_common::{
     COLLECTION_MODE_HOST_WIDE, COLLECTION_MODE_SCOPED, Event, EvidenceRecord,
     EvidenceSyntheticRecord, MonitorState, RuntimeEvent, RuntimePolicy, RuntimeSummary,
-    SyntheticRecordType, TargetWorkload, TpmSummary, UNKNOWN_WORKLOAD_INDEX, classified_tpm_digest,
-    classify_event, event_hash, final_summary_digest, generate_session_id, hex_encode, policy_hash,
-    session_start_digest, synthetic_record_hash,
+    SyntheticRecordType, TargetWorkload, TpmQuoteSummary, TpmSummary, UNKNOWN_WORKLOAD_INDEX,
+    classified_tpm_digest, classify_event, event_hash, final_summary_digest, generate_session_id,
+    hex_encode, policy_hash, session_start_digest, synthetic_record_hash,
 };
 
 mod tpm;
@@ -75,6 +75,27 @@ struct TpmBindingState {
     session_start_digest: [u8; 32],
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+struct TpmQuoteOptions {
+    enabled: bool,
+    nonce_hex: Option<String>,
+    ak_context: Option<PathBuf>,
+    ak_public_path: Option<PathBuf>,
+    quote_out_dir: Option<PathBuf>,
+}
+
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
+enum TpmQuoteConfig {
+    #[default]
+    Disabled,
+    Enabled {
+        nonce_hex: String,
+        ak_context: PathBuf,
+        ak_public_path: PathBuf,
+        quote_out_dir: PathBuf,
+    },
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SingleCollectorConfig {
@@ -87,6 +108,12 @@ struct SingleCollectorConfig {
     tpm_tcti: Option<String>,
     #[serde(default)]
     tpm_reset_pcr: bool,
+    #[serde(default)]
+    tpm_quote_enabled: bool,
+    tpm_quote_nonce: Option<String>,
+    tpm_ak_context: Option<String>,
+    tpm_ak_public: Option<String>,
+    tpm_quote_out_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -100,6 +127,12 @@ struct MultiCollectorConfig {
     tpm_tcti: Option<String>,
     #[serde(default)]
     tpm_reset_pcr: bool,
+    #[serde(default)]
+    tpm_quote_enabled: bool,
+    tpm_quote_nonce: Option<String>,
+    tpm_ak_context: Option<String>,
+    tpm_ak_public: Option<String>,
+    tpm_quote_out_dir: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -186,6 +219,25 @@ impl CollectorConfig {
             },
         }
     }
+
+    fn tpm_quote_options(&self) -> TpmQuoteOptions {
+        match self {
+            Self::Single(config) => TpmQuoteOptions {
+                enabled: config.tpm_quote_enabled,
+                nonce_hex: config.tpm_quote_nonce.clone(),
+                ak_context: config.tpm_ak_context.as_ref().map(PathBuf::from),
+                ak_public_path: config.tpm_ak_public.as_ref().map(PathBuf::from),
+                quote_out_dir: config.tpm_quote_out_dir.as_ref().map(PathBuf::from),
+            },
+            Self::Multi(config) => TpmQuoteOptions {
+                enabled: config.tpm_quote_enabled,
+                nonce_hex: config.tpm_quote_nonce.clone(),
+                ak_context: config.tpm_ak_context.as_ref().map(PathBuf::from),
+                ak_public_path: config.tpm_ak_public.as_ref().map(PathBuf::from),
+                quote_out_dir: config.tpm_quote_out_dir.as_ref().map(PathBuf::from),
+            },
+        }
+    }
 }
 
 impl CollectionMode {
@@ -218,10 +270,12 @@ struct EvidenceCapture {
     malformed_samples: usize,
     capture_state: EvidenceCaptureState,
     tpm_config: tpm::TpmConfig,
+    tpm_quote_config: TpmQuoteConfig,
     tpm_binding: Option<TpmBindingState>,
     tpm_final_summary: Option<TpmSummary>,
     tpm_event_extend_count: u64,
     tpm_failure_reason: Option<String>,
+    tpm_quote_failure_reason: Option<String>,
 }
 
 impl EvidenceCapture {
@@ -251,10 +305,12 @@ impl EvidenceCapture {
             malformed_samples: 0,
             capture_state: EvidenceCaptureState::Open,
             tpm_config,
+            tpm_quote_config: TpmQuoteConfig::default(),
             tpm_binding: None,
             tpm_final_summary: None,
             tpm_event_extend_count: 0,
             tpm_failure_reason: None,
+            tpm_quote_failure_reason: None,
         };
         capture
             .write_synthetic_record(SyntheticRecordType::MonitorStart, "monitor session started")?;
@@ -263,6 +319,48 @@ impl EvidenceCapture {
             policy_source.loaded_reason(),
         )?;
         Ok(capture)
+    }
+
+    fn configure_tpm_quote(&mut self, options: TpmQuoteOptions) -> Result<()> {
+        if !options.enabled {
+            self.tpm_quote_config = TpmQuoteConfig::Disabled;
+            return Ok(());
+        }
+
+        if !self.tpm_config.enabled {
+            return Err(anyhow!(
+                "tpm_quote_enabled requires attestation.backend `tpm`"
+            ));
+        }
+
+        let nonce_hex = validate_nonce_hex(
+            options
+                .nonce_hex
+                .as_deref()
+                .ok_or_else(|| anyhow!("tpm_quote_nonce is required when quote is enabled"))?,
+        )?;
+        let ak_context = options
+            .ak_context
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| anyhow!("tpm_ak_context is required when quote is enabled"))?;
+        let ak_public_path = options
+            .ak_public_path
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or_else(|| anyhow!("tpm_ak_public is required when quote is enabled"))?;
+        let quote_out_dir = options
+            .quote_out_dir
+            .unwrap_or_else(|| PathBuf::from("tpm_quote"));
+        validate_safe_relative_path(&quote_out_dir, "tpm_quote_out_dir")?;
+
+        // Stage 8 is an offline prototype: a configured nonce demonstrates
+        // nonce-bound quote checking, not a full live remote challenge flow.
+        self.tpm_quote_config = TpmQuoteConfig::Enabled {
+            nonce_hex,
+            ak_context,
+            ak_public_path,
+            quote_out_dir,
+        };
+        Ok(())
     }
 
     fn process_sample<R>(
@@ -556,6 +654,15 @@ impl EvidenceCapture {
                     hex_encode(&final_digest)
                 ));
             }
+            if matches!(self.tpm_quote_config, TpmQuoteConfig::Enabled { .. })
+                && summary.quote.is_none()
+                && self.tpm_quote_failure_reason.is_none()
+            {
+                let mut summary = summary;
+                summary.quote = self.generate_tpm_quote(runner)?;
+                self.tpm_final_summary = Some(summary.clone());
+                return Ok(Some(summary));
+            }
             return Ok(Some(summary));
         }
 
@@ -566,7 +673,7 @@ impl EvidenceCapture {
             return Ok(None);
         };
 
-        let result = (|| -> Result<TpmSummary> {
+        let binding_result = (|| -> Result<TpmSummary> {
             tpm::pcr_extend(runner, &self.tpm_config, &hex_encode(&final_digest))?;
             let final_pcr = tpm::pcr_read(runner, &self.tpm_config)?.digest_hex;
             let runtime_pcr = self
@@ -585,16 +692,95 @@ impl EvidenceCapture {
                 final_pcr: Some(final_pcr),
                 session_start_digest: hex_encode(&binding.session_start_digest),
                 final_summary_digest: hex_encode(&final_digest),
+                quote: None,
             })
         })();
 
-        match result {
-            Ok(summary) => {
+        match binding_result {
+            Ok(mut summary) => {
+                self.tpm_final_summary = Some(summary.clone());
+                summary.quote = self.generate_tpm_quote(runner)?;
                 self.tpm_final_summary = Some(summary.clone());
                 Ok(Some(summary))
             }
             Err(error) => {
                 self.record_tpm_failure("TPM final-summary binding failed", error)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn generate_tpm_quote<R>(&mut self, runner: &R) -> Result<Option<TpmQuoteSummary>>
+    where
+        R: tpm::TpmCommandRunner,
+    {
+        let TpmQuoteConfig::Enabled {
+            nonce_hex,
+            ak_context,
+            ak_public_path,
+            quote_out_dir,
+        } = self.tpm_quote_config.clone()
+        else {
+            return Ok(None);
+        };
+
+        let result = (|| -> Result<TpmQuoteSummary> {
+            let pcr_selection = self.tpm_config.pcr_selection()?;
+            let quote_base = format!("{}.quote", self.session_id_hex);
+            let quote_message_path = quote_out_dir.join(format!("{quote_base}.msg"));
+            let quote_signature_path = quote_out_dir.join(format!("{quote_base}.sig"));
+            let quote_pcrs_path = quote_out_dir.join(format!("{quote_base}.pcrs"));
+            let quote_ak_public_path =
+                quote_out_dir.join(format!("{}.akpub.pem", self.session_id_hex));
+            let summary_dir = summary_parent_dir(&self.summary_out);
+            let quote_message_abs = summary_dir.join(&quote_message_path);
+            let quote_signature_abs = summary_dir.join(&quote_signature_path);
+            let quote_pcrs_abs = summary_dir.join(&quote_pcrs_path);
+            let quote_ak_public_abs = summary_dir.join(&quote_ak_public_path);
+
+            if let Some(parent) = quote_message_abs.parent()
+                && !parent.as_os_str().is_empty()
+            {
+                fs::create_dir_all(parent).map_err(|error| {
+                    anyhow!(
+                        "failed to create TPM quote output directory {}: {error}",
+                        parent.display()
+                    )
+                })?;
+            }
+
+            fs::copy(&ak_public_path, &quote_ak_public_abs).map_err(|error| {
+                anyhow!(
+                    "failed to copy TPM AK public key from {} to {}: {error}",
+                    ak_public_path.display(),
+                    quote_ak_public_abs.display()
+                )
+            })?;
+
+            let request = tpm::TpmQuoteRequest {
+                ak_context,
+                nonce_hex: nonce_hex.clone(),
+                pcr_selection: pcr_selection.clone(),
+                quote_message_path: quote_message_abs,
+                quote_signature_path: quote_signature_abs,
+                quote_pcrs_path: quote_pcrs_abs,
+            };
+            tpm::quote(runner, &self.tpm_config, &request)?;
+
+            Ok(TpmQuoteSummary {
+                nonce_hex,
+                pcr_selection,
+                quote_message_path: relative_path_to_string(&quote_message_path)?,
+                quote_signature_path: relative_path_to_string(&quote_signature_path)?,
+                quote_pcrs_path: relative_path_to_string(&quote_pcrs_path)?,
+                ak_public_path: Some(relative_path_to_string(&quote_ak_public_path)?),
+            })
+        })();
+
+        match result {
+            Ok(summary) => Ok(Some(summary)),
+            Err(error) => {
+                self.record_tpm_quote_failure(error)?;
                 Ok(None)
             }
         }
@@ -614,24 +800,39 @@ impl EvidenceCapture {
         Ok(())
     }
 
+    fn record_tpm_quote_failure(&mut self, error: anyhow::Error) -> Result<()> {
+        let reason = format!("TPM quote generation failed: {error}");
+        if self.tpm_config.fail_on_tpm_error {
+            return Err(anyhow!(reason));
+        }
+
+        warn!("TPM quote generation failed open: {reason}");
+        self.tpm_quote_failure_reason.get_or_insert(reason);
+        Ok(())
+    }
+
     fn summary_attestation_status_and_reason(&self) -> (String, Option<String>) {
         let (status, reason) = attestation_status_and_reason(&self.state, &self.policy);
-        let Some(tpm_failure_reason) = self.tpm_failure_reason.as_deref() else {
-            return (status.to_owned(), reason);
-        };
+        let mut status = status.to_owned();
+        let mut reason = reason;
 
-        let tpm_reason = format!("TPM binding failed open: {tpm_failure_reason}");
-        let status = if status == "passed" {
-            "warning"
-        } else {
-            status
-        };
-        let reason = match reason {
-            Some(reason) => Some(format!("{reason}; {tpm_reason}")),
-            None => Some(tpm_reason),
-        };
+        if let Some(tpm_failure_reason) = self.tpm_failure_reason.as_deref() {
+            let tpm_reason = format!("TPM binding failed open: {tpm_failure_reason}");
+            if status == "passed" {
+                status = String::from("warning");
+            }
+            reason = append_failure_reason(reason, tpm_reason);
+        }
 
-        (status.to_owned(), reason)
+        if let Some(quote_failure_reason) = self.tpm_quote_failure_reason.as_deref() {
+            let quote_reason = format!("TPM quote generation failed open: {quote_failure_reason}");
+            if status == "passed" {
+                status = String::from("warning");
+            }
+            reason = append_failure_reason(reason, quote_reason);
+        }
+
+        (status, reason)
     }
 
     fn ensure_open(&self, operation: &str) -> Result<()> {
@@ -738,6 +939,60 @@ fn validate_collector_config(config: &CollectorConfig) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn validate_nonce_hex(value: &str) -> Result<String> {
+    let value = value
+        .trim()
+        .strip_prefix("0x")
+        .unwrap_or_else(|| value.trim());
+    if value.len() != 64 || !value.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "tpm_quote_nonce must be a 64-character SHA-256 hex value"
+        ));
+    }
+    Ok(value.to_ascii_lowercase())
+}
+
+fn validate_safe_relative_path(path: &Path, label: &str) -> Result<()> {
+    if path.as_os_str().is_empty() {
+        return Err(anyhow!("{label} must not be empty"));
+    }
+    if path.is_absolute() {
+        return Err(anyhow!("{label} must be a relative path"));
+    }
+    for component in path.components() {
+        match component {
+            Component::Normal(_) => {}
+            Component::ParentDir => {
+                return Err(anyhow!("{label} must not contain `..` components"));
+            }
+            _ => return Err(anyhow!("{label} contains unsupported path components")),
+        }
+    }
+    Ok(())
+}
+
+fn relative_path_to_string(path: &Path) -> Result<String> {
+    validate_safe_relative_path(path, "relative path")?;
+    path.to_str()
+        .map(str::to_owned)
+        .ok_or_else(|| anyhow!("relative path is not valid UTF-8: {}", path.display()))
+}
+
+fn summary_parent_dir(summary_path: &Path) -> PathBuf {
+    summary_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+fn append_failure_reason(reason: Option<String>, addition: String) -> Option<String> {
+    match reason {
+        Some(reason) => Some(format!("{reason}; {addition}")),
+        None => Some(addition),
+    }
 }
 
 fn log_tpm_config(config: &tpm::TpmConfig) {
@@ -1115,6 +1370,7 @@ async fn main() -> Result<()> {
         policy_source,
         tpm_config,
     )?;
+    evidence.configure_tpm_quote(collector_config.tpm_quote_options())?;
 
     let rlim = libc::rlimit {
         rlim_cur: libc::RLIM_INFINITY,
@@ -1386,6 +1642,36 @@ mod tests {
         .expect("enabled tpm config")
     }
 
+    const TEST_AK_PUBLIC_BYTES: &[u8] = b"mock ak public\n";
+
+    fn quote_options_with_ak_public(ak_public_path: PathBuf) -> TpmQuoteOptions {
+        TpmQuoteOptions {
+            enabled: true,
+            nonce_hex: Some(String::from(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            )),
+            ak_context: Some(PathBuf::from("attestation/ak.ctx")),
+            ak_public_path: Some(ak_public_path),
+            quote_out_dir: Some(PathBuf::from("attestation/quotes")),
+        }
+    }
+
+    fn write_test_ak_public(path: &Path) {
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).expect("ak public parent");
+        }
+        fs::write(path, TEST_AK_PUBLIC_BYTES).expect("ak public source");
+    }
+
+    fn quote_call_count(calls: &[MockTpmCall]) -> usize {
+        calls
+            .iter()
+            .filter(|call| call.program == "tpm2_quote")
+            .count()
+    }
+
     fn state_with_counts(suspicious_count: u64, denied_count: u64) -> RuntimeEvidenceState {
         let mut state = RuntimeEvidenceState::new([1u8; 32]);
         for _ in 0..suspicious_count {
@@ -1463,7 +1749,12 @@ mod tests {
                 "collection_mode": "scoped",
                 "evidence_out": "logs/runtime_events.jsonl",
                 "tpm_tcti": "swtpm:host=localhost,port=2321",
-                "tpm_reset_pcr": true
+                "tpm_reset_pcr": true,
+                "tpm_quote_enabled": true,
+                "tpm_quote_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "tpm_ak_context": "attestation/ak.ctx",
+                "tpm_ak_public": "attestation/akpub.pem",
+                "tpm_quote_out_dir": "attestation/quotes"
             }"#,
         )
         .expect("collector config");
@@ -1475,6 +1766,25 @@ mod tests {
             Some("swtpm:host=localhost,port=2321")
         );
         assert!(options.reset_pcr);
+
+        let quote_options = config.tpm_quote_options();
+        assert!(quote_options.enabled);
+        assert_eq!(
+            quote_options.nonce_hex.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert_eq!(
+            quote_options.ak_context.as_deref(),
+            Some(Path::new("attestation/ak.ctx"))
+        );
+        assert_eq!(
+            quote_options.ak_public_path.as_deref(),
+            Some(Path::new("attestation/akpub.pem"))
+        );
+        assert_eq!(
+            quote_options.quote_out_dir.as_deref(),
+            Some(Path::new("attestation/quotes"))
+        );
     }
 
     fn temp_output_paths(test_name: &str) -> (PathBuf, PathBuf) {
@@ -1954,6 +2264,7 @@ mod tests {
         );
         assert_eq!(tpm_summary.reset_pcr, true);
         assert_eq!(tpm_summary.event_extend_count, 0);
+        assert!(tpm_summary.quote.is_none());
 
         assert_eq!(
             runner.calls(),
@@ -1987,6 +2298,292 @@ mod tests {
 
         let _ = fs::remove_file(evidence_out);
         let _ = fs::remove_file(summary_out);
+    }
+
+    #[test]
+    fn tpm_quote_enabled_generates_quote_after_final_pcr() {
+        let (evidence_out, summary_out) = temp_output_paths("tpm-quote-enabled");
+        let workloads = test_workloads();
+        let policy = tpm_runtime_policy(true);
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            summary_out.clone(),
+            &workloads,
+            CollectionMode::Scoped,
+            policy.clone(),
+            PolicySource::Configured,
+            enabled_tpm_config(&policy, true),
+        )
+        .expect("evidence capture");
+        let ak_public_source = summary_out.with_file_name("source-akpub.pem");
+        write_test_ak_public(&ak_public_source);
+        evidence
+            .configure_tpm_quote(quote_options_with_ak_public(ak_public_source.clone()))
+            .expect("quote config");
+        let runner = MockTpmRunner::new([0u8; 32]);
+
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+        evidence
+            .bind_tpm_session_start(&runner)
+            .expect("session-start binding");
+        evidence
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &runner)
+            .expect("summary");
+
+        let summary = serde_json::from_str::<RuntimeSummary>(
+            &fs::read_to_string(&summary_out).expect("summary"),
+        )
+        .expect("runtime summary");
+        let quote = summary
+            .tpm
+            .as_ref()
+            .expect("tpm")
+            .quote
+            .as_ref()
+            .expect("quote");
+        let calls = runner.calls();
+        let quote_call = calls
+            .iter()
+            .find(|call| call.program == "tpm2_quote")
+            .expect("quote call");
+        let final_pcr_read_index = calls
+            .iter()
+            .rposition(|call| call.program == "tpm2_pcrread")
+            .expect("final pcr read");
+        let quote_index = calls
+            .iter()
+            .position(|call| call.program == "tpm2_quote")
+            .expect("quote index");
+
+        assert!(quote_index > final_pcr_read_index);
+        assert_eq!(
+            quote.nonce_hex,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(quote.pcr_selection, "sha256:23");
+        let expected_ak_public_path =
+            format!("attestation/quotes/{}.akpub.pem", summary.session_id);
+        assert_eq!(
+            quote.ak_public_path.as_deref(),
+            Some(expected_ak_public_path.as_str())
+        );
+        let copied_ak_public_path = summary_out
+            .parent()
+            .expect("summary parent")
+            .join(&expected_ak_public_path);
+        assert_eq!(
+            fs::read(copied_ak_public_path).expect("copied ak public"),
+            TEST_AK_PUBLIC_BYTES
+        );
+        assert_eq!(
+            quote.quote_message_path,
+            format!("attestation/quotes/{}.quote.msg", summary.session_id)
+        );
+        assert_eq!(
+            quote.quote_signature_path,
+            format!("attestation/quotes/{}.quote.sig", summary.session_id)
+        );
+        assert_eq!(
+            quote.quote_pcrs_path,
+            format!("attestation/quotes/{}.quote.pcrs", summary.session_id)
+        );
+        assert_eq!(
+            quote_call.args,
+            vec![
+                String::from("-c"),
+                String::from("attestation/ak.ctx"),
+                String::from("-l"),
+                String::from("sha256:23"),
+                String::from("-q"),
+                String::from("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+                String::from("-m"),
+                summary_out
+                    .parent()
+                    .expect("summary parent")
+                    .join(&quote.quote_message_path)
+                    .to_string_lossy()
+                    .into_owned(),
+                String::from("-s"),
+                summary_out
+                    .parent()
+                    .expect("summary parent")
+                    .join(&quote.quote_signature_path)
+                    .to_string_lossy()
+                    .into_owned(),
+                String::from("-o"),
+                summary_out
+                    .parent()
+                    .expect("summary parent")
+                    .join(&quote.quote_pcrs_path)
+                    .to_string_lossy()
+                    .into_owned(),
+                String::from("-F"),
+                String::from("values"),
+                String::from("-g"),
+                String::from("sha256"),
+            ]
+        );
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_out);
+        let _ = fs::remove_file(ak_public_source);
+    }
+
+    #[test]
+    fn tpm_quote_failure_fails_closed_when_policy_requires_it() {
+        let (evidence_out, summary_out) = temp_output_paths("tpm-quote-fail-closed");
+        let workloads = test_workloads();
+        let policy = tpm_runtime_policy(true);
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            summary_out.clone(),
+            &workloads,
+            CollectionMode::Scoped,
+            policy.clone(),
+            PolicySource::Configured,
+            enabled_tpm_config(&policy, true),
+        )
+        .expect("evidence capture");
+        let ak_public_source = summary_out.with_file_name("source-akpub.pem");
+        write_test_ak_public(&ak_public_source);
+        evidence
+            .configure_tpm_quote(quote_options_with_ak_public(ak_public_source.clone()))
+            .expect("quote config");
+        let runner = MockTpmRunner::failing("tpm2_quote");
+
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+        evidence
+            .bind_tpm_session_start(&runner)
+            .expect("session-start binding");
+        let result = evidence.write_summary(&MonitorState { seq: 0, lost: 0 }, &runner);
+
+        assert!(result.is_err());
+        let error = result.expect_err("quote failure").to_string();
+        assert!(error.contains("TPM quote generation failed"));
+        assert!(!error.contains("TPM final-summary binding failed"));
+        assert!(fs::read_to_string(&summary_out).is_err());
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_out);
+        let _ = fs::remove_file(ak_public_source);
+    }
+
+    #[test]
+    fn tpm_quote_failure_can_fail_open_without_quote_metadata() {
+        let (evidence_out, summary_out) = temp_output_paths("tpm-quote-fail-open");
+        let workloads = test_workloads();
+        let policy = tpm_runtime_policy(false);
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            summary_out.clone(),
+            &workloads,
+            CollectionMode::Scoped,
+            policy.clone(),
+            PolicySource::Configured,
+            enabled_tpm_config(&policy, true),
+        )
+        .expect("evidence capture");
+        let ak_public_source = summary_out.with_file_name("source-akpub.pem");
+        write_test_ak_public(&ak_public_source);
+        evidence
+            .configure_tpm_quote(quote_options_with_ak_public(ak_public_source.clone()))
+            .expect("quote config");
+        let runner = MockTpmRunner::failing("tpm2_quote");
+
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+        evidence
+            .bind_tpm_session_start(&runner)
+            .expect("session-start binding");
+        evidence
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &runner)
+            .expect("summary");
+
+        let summary = serde_json::from_str::<RuntimeSummary>(
+            &fs::read_to_string(&summary_out).expect("summary"),
+        )
+        .expect("runtime summary");
+
+        assert_eq!(summary.attestation_status, "warning");
+        assert!(
+            summary
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("TPM quote generation failed open"))
+        );
+        assert!(summary.tpm.as_ref().expect("tpm").quote.is_none());
+        assert!(summary.final_summary_digest.is_some());
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_out);
+        let _ = fs::remove_file(ak_public_source);
+    }
+
+    #[test]
+    fn summary_retry_after_quote_succeeds_reuses_cached_quote_metadata() {
+        let (evidence_out, summary_path) = temp_output_paths("tpm-quote-retry");
+        let blocked_summary_out = summary_path.with_file_name("blocked-summary-dir");
+        fs::create_dir_all(&blocked_summary_out).expect("blocked summary dir");
+        let workloads = test_workloads();
+        let policy = tpm_runtime_policy(true);
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            blocked_summary_out.clone(),
+            &workloads,
+            CollectionMode::Scoped,
+            policy.clone(),
+            PolicySource::Configured,
+            enabled_tpm_config(&policy, true),
+        )
+        .expect("evidence capture");
+        let ak_public_source = summary_path.with_file_name("source-akpub.pem");
+        write_test_ak_public(&ak_public_source);
+        evidence
+            .configure_tpm_quote(quote_options_with_ak_public(ak_public_source.clone()))
+            .expect("quote config");
+        let runner = MockTpmRunner::new([0u8; 32]);
+
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+        evidence
+            .bind_tpm_session_start(&runner)
+            .expect("session-start binding");
+        let first_result = evidence.write_summary(&MonitorState { seq: 0, lost: 0 }, &runner);
+        assert!(first_result.is_err());
+        assert_eq!(evidence.capture_state, EvidenceCaptureState::StopWritten);
+        assert_eq!(quote_call_count(&runner.calls()), 1);
+
+        let cached_quote = evidence
+            .tpm_final_summary
+            .as_ref()
+            .and_then(|summary| summary.quote.clone())
+            .expect("cached quote");
+        evidence.summary_out = summary_path.clone();
+        evidence
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &runner)
+            .expect("retry summary");
+
+        let summary = serde_json::from_str::<RuntimeSummary>(
+            &fs::read_to_string(&summary_path).expect("summary"),
+        )
+        .expect("runtime summary");
+
+        assert_eq!(quote_call_count(&runner.calls()), 1);
+        assert_eq!(
+            summary.tpm.as_ref().expect("tpm").quote.as_ref(),
+            Some(&cached_quote)
+        );
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_path);
+        let _ = fs::remove_file(ak_public_source);
+        let _ = fs::remove_dir(blocked_summary_out);
     }
 
     #[test]

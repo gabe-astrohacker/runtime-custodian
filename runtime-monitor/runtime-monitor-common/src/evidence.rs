@@ -421,6 +421,19 @@ pub enum EvidenceRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct TpmQuoteSummary {
+    pub nonce_hex: String,
+    pub pcr_selection: String,
+    pub quote_message_path: String,
+    pub quote_signature_path: String,
+    pub quote_pcrs_path: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ak_public_path: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TpmSummary {
     pub enabled: bool,
     pub hash_bank: String,
@@ -443,6 +456,9 @@ pub struct TpmSummary {
 
     pub session_start_digest: String,
     pub final_summary_digest: String,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub quote: Option<TpmQuoteSummary>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1141,6 +1157,26 @@ mod tests {
         let summary = serde_json::from_str::<TpmSummary>(json).expect("tpm summary");
 
         assert_eq!(summary.event_extend_count, 0);
+        assert!(summary.quote.is_none());
+    }
+
+    #[test]
+    fn tpm_quote_summary_ser_de_round_trip() {
+        let quote = TpmQuoteSummary {
+            nonce_hex: String::from(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ),
+            pcr_selection: String::from("sha256:23"),
+            quote_message_path: String::from("tpm_quote/session.quote.msg"),
+            quote_signature_path: String::from("tpm_quote/session.quote.sig"),
+            quote_pcrs_path: String::from("tpm_quote/session.quote.pcrs"),
+            ak_public_path: Some(String::from("attestation/akpub.pem")),
+        };
+
+        let encoded = serde_json::to_string(&quote).expect("serialize quote");
+        let decoded = serde_json::from_str::<TpmQuoteSummary>(&encoded).expect("deserialize quote");
+
+        assert_eq!(decoded, quote);
     }
 
     #[test]
