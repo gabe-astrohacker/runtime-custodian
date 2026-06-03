@@ -73,7 +73,7 @@ pub mod evidence;
 pub use evidence::{
     AcceptablePolicy, AttestationPolicy, ClassificationResult, DeniedPolicy, EventClassification,
     EvidenceEvent, EvidenceRecord, EvidenceSyntheticRecord, RuntimeEvent, RuntimePolicy,
-    RuntimeSummary, SuspiciousPolicy, SyntheticRecordType, classify_event, event_hash,
-    generate_session_id, hex_decode_32, hex_encode, policy_hash, synthetic_record_hash,
-    update_software_chain,
+    RuntimeSummary, SuspiciousPolicy, SyntheticRecordType, TpmSummary, classify_event, event_hash,
+    final_summary_digest, generate_session_id, hex_decode_32, hex_encode, policy_hash,
+    replay_pcr_extend, session_start_digest, synthetic_record_hash, update_software_chain,
 };

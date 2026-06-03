@@ -15,6 +15,7 @@ const POLICY_DOMAIN: &[u8] = b"rta-policy-v1";
 const SYNTHETIC_RECORD_DOMAIN: &[u8] = b"rta-synthetic-record-v1";
 const CLASSIFIED_TPM_EVENT_DOMAIN: &[u8] = b"rta-classified-event-v1";
 const FINAL_SUMMARY_DOMAIN: &[u8] = b"rta-final-summary-v1";
+const SESSION_START_DOMAIN: &[u8] = b"rta-session-start-v1";
 
 pub const RUNTIME_SUMMARY_SCHEMA_VERSION: u32 = 1;
 pub const ZERO_CHAIN_HEAD: [u8; 32] = [0u8; 32];
@@ -420,6 +421,29 @@ pub enum EvidenceRecord {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
+pub struct TpmSummary {
+    pub enabled: bool,
+    pub hash_bank: String,
+    pub runtime_pcr: u32,
+
+    #[serde(default)]
+    pub reset_pcr: bool,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_pcr: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_session_start_pcr: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub final_pcr: Option<String>,
+
+    pub session_start_digest: String,
+    pub final_summary_digest: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct RuntimeSummary {
     pub schema_version: u32,
     pub session_id: String,
@@ -446,6 +470,9 @@ pub struct RuntimeSummary {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_summary_digest: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tpm: Option<TpmSummary>,
 }
 
 /// Shared sequence, count, and software-chain state for evidence replay.
@@ -619,6 +646,31 @@ pub fn classified_tpm_digest(
 
     let mut hasher = Sha256::new();
     hasher.update(buf);
+    finalize_sha256(hasher)
+}
+
+pub fn session_start_digest(
+    session_id: &[u8; 32],
+    policy_hash: [u8; 32],
+    workload_id: &str,
+    collection_mode: &str,
+) -> [u8; 32] {
+    let mut buf = Vec::new();
+    buf.extend_from_slice(SESSION_START_DOMAIN);
+    buf.extend_from_slice(session_id);
+    buf.extend_from_slice(&policy_hash);
+    encode_str(&mut buf, workload_id);
+    encode_str(&mut buf, collection_mode);
+
+    let mut hasher = Sha256::new();
+    hasher.update(buf);
+    finalize_sha256(hasher)
+}
+
+pub fn replay_pcr_extend(old_pcr: [u8; 32], digest: [u8; 32]) -> [u8; 32] {
+    let mut hasher = Sha256::new();
+    hasher.update(old_pcr);
+    hasher.update(digest);
     finalize_sha256(hasher)
 }
 
@@ -1066,6 +1118,7 @@ mod tests {
         let summary = serde_json::from_str::<RuntimeSummary>(json).expect("summary");
 
         assert_eq!(summary.synthetic_record_count, 0);
+        assert!(summary.tpm.is_none());
     }
 
     #[test]
@@ -1216,6 +1269,54 @@ mod tests {
         );
 
         assert_ne!(suspicious, denied);
+    }
+
+    #[test]
+    fn session_start_digest_is_deterministic() {
+        let session = [1u8; 32];
+        let policy = [2u8; 32];
+
+        let left = session_start_digest(&session, policy, "workload-a", "scoped");
+        let right = session_start_digest(&session, policy, "workload-a", "scoped");
+
+        assert_eq!(left, right);
+    }
+
+    #[test]
+    fn session_start_digest_depends_on_all_inputs() {
+        let session = [1u8; 32];
+        let policy = [2u8; 32];
+        let baseline = session_start_digest(&session, policy, "workload-a", "scoped");
+
+        assert_ne!(
+            baseline,
+            session_start_digest(&[3u8; 32], policy, "workload-a", "scoped")
+        );
+        assert_ne!(
+            baseline,
+            session_start_digest(&session, [4u8; 32], "workload-a", "scoped")
+        );
+        assert_ne!(
+            baseline,
+            session_start_digest(&session, policy, "workload-b", "scoped")
+        );
+        assert_ne!(
+            baseline,
+            session_start_digest(&session, policy, "workload-a", "host-wide")
+        );
+    }
+
+    #[test]
+    fn replay_pcr_extend_matches_sha256_concatenation() {
+        let old_pcr = [1u8; 32];
+        let digest = [2u8; 32];
+
+        let mut hasher = Sha256::new();
+        hasher.update(old_pcr);
+        hasher.update(digest);
+        let expected = finalize_sha256(hasher);
+
+        assert_eq!(replay_pcr_extend(old_pcr, digest), expected);
     }
 
     #[test]

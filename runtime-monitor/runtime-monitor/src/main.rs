@@ -18,8 +18,9 @@ use runtime_monitor_common::evidence::{RUNTIME_SUMMARY_SCHEMA_VERSION, RuntimeEv
 use runtime_monitor_common::{
     COLLECTION_MODE_HOST_WIDE, COLLECTION_MODE_SCOPED, Event, EvidenceRecord,
     EvidenceSyntheticRecord, MonitorState, RuntimeEvent, RuntimePolicy, RuntimeSummary,
-    SyntheticRecordType, TargetWorkload, UNKNOWN_WORKLOAD_INDEX, classify_event, event_hash,
-    generate_session_id, hex_encode, policy_hash, synthetic_record_hash,
+    SyntheticRecordType, TargetWorkload, TpmSummary, UNKNOWN_WORKLOAD_INDEX, classify_event,
+    event_hash, final_summary_digest, generate_session_id, hex_encode, policy_hash,
+    session_start_digest, synthetic_record_hash,
 };
 
 mod tpm;
@@ -65,6 +66,13 @@ enum EvidenceCaptureState {
     Open,
     StopWritten,
     Finalized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TpmBindingState {
+    initial_pcr: String,
+    after_session_start_pcr: String,
+    session_start_digest: [u8; 32],
 }
 
 #[derive(Debug, Deserialize)]
@@ -202,12 +210,17 @@ struct EvidenceCapture {
     collection_mode: CollectionMode,
     writer: BufWriter<File>,
     policy: RuntimePolicy,
+    policy_hash: [u8; 32],
     policy_hash_hex: String,
     session_id_hex: String,
     state: RuntimeEvidenceState,
     observed_lost: u64,
     malformed_samples: usize,
     capture_state: EvidenceCaptureState,
+    tpm_config: tpm::TpmConfig,
+    tpm_binding: Option<TpmBindingState>,
+    tpm_final_summary: Option<TpmSummary>,
+    tpm_failure_reason: Option<String>,
 }
 
 impl EvidenceCapture {
@@ -218,21 +231,28 @@ impl EvidenceCapture {
         collection_mode: CollectionMode,
         policy: RuntimePolicy,
         policy_source: PolicySource,
+        tpm_config: tpm::TpmConfig,
     ) -> Result<Self> {
         let session_id = generate_session_id();
-        let policy_hash_hex = hex_encode(&policy_hash(&policy));
+        let policy_hash = policy_hash(&policy);
+        let policy_hash_hex = hex_encode(&policy_hash);
         let mut capture = Self {
             summary_out,
             summary_workload_id: workload_summary_id(workloads, collection_mode),
             collection_mode,
             writer: create_evidence_writer(evidence_out)?,
             policy,
+            policy_hash,
             policy_hash_hex,
             session_id_hex: hex_encode(&session_id),
             state: RuntimeEvidenceState::new(session_id),
             observed_lost: 0,
             malformed_samples: 0,
             capture_state: EvidenceCaptureState::Open,
+            tpm_config,
+            tpm_binding: None,
+            tpm_final_summary: None,
+            tpm_failure_reason: None,
         };
         capture
             .write_synthetic_record(SyntheticRecordType::MonitorStart, "monitor session started")?;
@@ -303,7 +323,51 @@ impl EvidenceCapture {
         }
     }
 
-    fn write_summary(&mut self, final_state: &MonitorState) -> Result<()> {
+    fn bind_tpm_session_start<R>(&mut self, runner: &R) -> Result<()>
+    where
+        R: tpm::TpmCommandRunner,
+    {
+        self.ensure_open("bind TPM session start")?;
+
+        if !self.tpm_config.enabled || self.tpm_failure_reason.is_some() {
+            return Ok(());
+        }
+
+        let result = (|| -> Result<TpmBindingState> {
+            if self.tpm_config.reset_pcr {
+                tpm::pcr_reset(runner, &self.tpm_config)?;
+            }
+
+            let initial_pcr = tpm::pcr_read(runner, &self.tpm_config)?.digest_hex;
+            let session_digest = session_start_digest(
+                &self.state.session_id,
+                self.policy_hash,
+                &self.summary_workload_id,
+                self.collection_mode.as_str(),
+            );
+            tpm::pcr_extend(runner, &self.tpm_config, &hex_encode(&session_digest))?;
+            let after_session_start_pcr = tpm::pcr_read(runner, &self.tpm_config)?.digest_hex;
+
+            Ok(TpmBindingState {
+                initial_pcr,
+                after_session_start_pcr,
+                session_start_digest: session_digest,
+            })
+        })();
+
+        match result {
+            Ok(binding) => {
+                self.tpm_binding = Some(binding);
+                Ok(())
+            }
+            Err(error) => self.record_tpm_failure("TPM session-start binding failed", error),
+        }
+    }
+
+    fn write_summary<R>(&mut self, final_state: &MonitorState, runner: &R) -> Result<()>
+    where
+        R: tpm::TpmCommandRunner,
+    {
         match self.capture_state {
             EvidenceCaptureState::Open => {
                 self.write_synthetic_record(
@@ -328,8 +392,22 @@ impl EvidenceCapture {
             );
         }
 
-        let (attestation_status, failure_reason) =
-            attestation_status_and_reason(&self.state, &self.policy);
+        let final_digest = final_summary_digest(
+            &self.state.session_id,
+            self.state.software_chain_head,
+            self.state.event_count,
+            self.state.synthetic_record_count,
+            self.state.acceptable_count,
+            self.state.suspicious_count,
+            self.state.denied_count,
+            final_state.lost,
+            self.policy_hash,
+        );
+        let tpm_summary = self.finalize_tpm_binding(runner, final_digest)?;
+        let (attestation_status, failure_reason) = self.summary_attestation_status_and_reason();
+        let final_summary_digest = tpm_summary
+            .as_ref()
+            .map(|summary| summary.final_summary_digest.clone());
         let summary = RuntimeSummary {
             schema_version: RUNTIME_SUMMARY_SCHEMA_VERSION,
             session_id: self.session_id_hex.clone(),
@@ -347,7 +425,8 @@ impl EvidenceCapture {
             // TODO: validate and wire precise eBPF/ring-buffer drop semantics before making strong completeness claims.
             dropped_events: final_state.lost,
             software_chain_head: hex_encode(&self.state.software_chain_head),
-            final_summary_digest: None,
+            final_summary_digest,
+            tpm: tpm_summary,
         };
         write_runtime_summary(&summary, &self.summary_out)?;
         self.capture_state = EvidenceCaptureState::Finalized;
@@ -391,6 +470,100 @@ impl EvidenceCapture {
             software_chain_head: hex_encode(&software_chain_head),
         };
         self.write_record(&EvidenceRecord::Synthetic(record))
+    }
+
+    fn finalize_tpm_binding<R>(
+        &mut self,
+        runner: &R,
+        final_digest: [u8; 32],
+    ) -> Result<Option<TpmSummary>>
+    where
+        R: tpm::TpmCommandRunner,
+    {
+        if !self.tpm_config.enabled || self.tpm_failure_reason.is_some() {
+            return Ok(None);
+        }
+
+        if let Some(summary) = self.tpm_final_summary.clone() {
+            if summary.final_summary_digest != hex_encode(&final_digest) {
+                return Err(anyhow!(
+                    "cannot write runtime summary: cached TPM final-summary digest {} does not match current digest {}",
+                    summary.final_summary_digest,
+                    hex_encode(&final_digest)
+                ));
+            }
+            return Ok(Some(summary));
+        }
+
+        let Some(binding) = self.tpm_binding.clone() else {
+            let error =
+                anyhow!("TPM session-start binding was not completed before final summary binding");
+            self.record_tpm_failure("TPM final-summary binding failed", error)?;
+            return Ok(None);
+        };
+
+        let result = (|| -> Result<TpmSummary> {
+            tpm::pcr_extend(runner, &self.tpm_config, &hex_encode(&final_digest))?;
+            let final_pcr = tpm::pcr_read(runner, &self.tpm_config)?.digest_hex;
+            let runtime_pcr = self
+                .tpm_config
+                .runtime_pcr
+                .ok_or_else(|| anyhow!("TPM runtime PCR is not configured"))?;
+
+            Ok(TpmSummary {
+                enabled: true,
+                hash_bank: self.tpm_config.hash_bank.clone(),
+                runtime_pcr,
+                reset_pcr: self.tpm_config.reset_pcr,
+                initial_pcr: Some(binding.initial_pcr),
+                after_session_start_pcr: Some(binding.after_session_start_pcr),
+                final_pcr: Some(final_pcr),
+                session_start_digest: hex_encode(&binding.session_start_digest),
+                final_summary_digest: hex_encode(&final_digest),
+            })
+        })();
+
+        match result {
+            Ok(summary) => {
+                self.tpm_final_summary = Some(summary.clone());
+                Ok(Some(summary))
+            }
+            Err(error) => {
+                self.record_tpm_failure("TPM final-summary binding failed", error)?;
+                Ok(None)
+            }
+        }
+    }
+
+    fn record_tpm_failure(&mut self, context: &str, error: anyhow::Error) -> Result<()> {
+        let reason = format!("{context}: {error}");
+        if self.tpm_config.fail_on_tpm_error {
+            return Err(anyhow!(reason));
+        }
+
+        warn!("TPM binding failed open: {reason}");
+        self.tpm_failure_reason.get_or_insert(reason);
+        Ok(())
+    }
+
+    fn summary_attestation_status_and_reason(&self) -> (String, Option<String>) {
+        let (status, reason) = attestation_status_and_reason(&self.state, &self.policy);
+        let Some(tpm_failure_reason) = self.tpm_failure_reason.as_deref() else {
+            return (status.to_owned(), reason);
+        };
+
+        let tpm_reason = format!("TPM binding failed open: {tpm_failure_reason}");
+        let status = if status == "passed" {
+            "warning"
+        } else {
+            status
+        };
+        let reason = match reason {
+            Some(reason) => Some(format!("{reason}; {tpm_reason}")),
+            None => Some(tpm_reason),
+        };
+
+        (status.to_owned(), reason)
     }
 
     fn ensure_open(&self, operation: &str) -> Result<()> {
@@ -511,7 +684,7 @@ fn log_tpm_config(config: &tpm::TpmConfig) {
         .unwrap_or_else(|| String::from("<none>"));
     let tcti = config.tcti.as_deref().unwrap_or("<default>");
     info!(
-        "TPM backend configured for Stage 5 validation only: hash_bank={} runtime_pcr={} reset_pcr={} tcti={} fail_on_tpm_error={}",
+        "TPM backend configured: hash_bank={} runtime_pcr={} reset_pcr={} tcti={} fail_on_tpm_error={}",
         config.hash_bank, runtime_pcr, config.reset_pcr, tcti, config.fail_on_tpm_error
     );
 }
@@ -864,6 +1037,7 @@ async fn main() -> Result<()> {
         collector_config.tpm_local_options(),
     )?;
     log_tpm_config(&tpm_config);
+    let tpm_runner = tpm::SystemTpmCommandRunner;
     let mut evidence = EvidenceCapture::new(
         evidence_out,
         summary_out,
@@ -871,6 +1045,7 @@ async fn main() -> Result<()> {
         collection_mode,
         runtime_policy,
         policy_source,
+        tpm_config,
     )?;
 
     let rlim = libc::rlimit {
@@ -890,6 +1065,7 @@ async fn main() -> Result<()> {
     populate_target_cgroups(&mut ebpf, &collector_config)?;
     set_collection_mode(&mut ebpf, collection_mode)?;
     evidence.write_workload_target_bound(&workloads)?;
+    evidence.bind_tpm_session_start(&tpm_runner)?;
 
     match aya_log::EbpfLogger::init(&mut ebpf) {
         Err(e) => warn!("failed to initialize eBPF logger: {e}"),
@@ -942,7 +1118,7 @@ async fn main() -> Result<()> {
         warn!("failed to read final monitor state for summary: {e}");
         evidence.fallback_monitor_state()
     });
-    evidence.write_summary(&final_state)?;
+    evidence.write_summary(&final_state, &tpm_runner)?;
     println!(
         "Wrote evidence summary: {}",
         evidence.summary_path().display()
@@ -954,9 +1130,138 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use runtime_monitor_common::{
-        EventClassification, EventType, EvidenceRecord, PATH_LEN, SyntheticRecordType,
-        TASK_COMM_LEN,
+        AttestationPolicy, EventClassification, EventType, EvidenceRecord, PATH_LEN,
+        SyntheticRecordType, TASK_COMM_LEN,
     };
+    use std::cell::RefCell;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{ExitStatus, Output};
+
+    struct NoopTpmRunner;
+
+    impl tpm::TpmCommandRunner for NoopTpmRunner {
+        fn run(&self, program: &str, _args: &[String], _envs: &[(&str, &str)]) -> Result<Output> {
+            Err(anyhow!(
+                "unexpected TPM command in TPM-disabled test: {program}"
+            ))
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct MockTpmCall {
+        program: String,
+        args: Vec<String>,
+    }
+
+    struct MockTpmRunner {
+        calls: RefCell<Vec<MockTpmCall>>,
+        pcr: RefCell<[u8; 32]>,
+        fail_program: Option<&'static str>,
+    }
+
+    impl MockTpmRunner {
+        fn new(initial_pcr: [u8; 32]) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                pcr: RefCell::new(initial_pcr),
+                fail_program: None,
+            }
+        }
+
+        fn failing(program: &'static str) -> Self {
+            Self {
+                calls: RefCell::new(Vec::new()),
+                pcr: RefCell::new([0u8; 32]),
+                fail_program: Some(program),
+            }
+        }
+
+        fn calls(&self) -> Vec<MockTpmCall> {
+            self.calls.borrow().clone()
+        }
+    }
+
+    impl tpm::TpmCommandRunner for MockTpmRunner {
+        fn run(&self, program: &str, args: &[String], _envs: &[(&str, &str)]) -> Result<Output> {
+            self.calls.borrow_mut().push(MockTpmCall {
+                program: program.to_owned(),
+                args: args.to_vec(),
+            });
+
+            if self
+                .fail_program
+                .is_some_and(|candidate| candidate == program)
+            {
+                return Ok(Output {
+                    status: ExitStatus::from_raw(1),
+                    stdout: Vec::new(),
+                    stderr: b"mock TPM failure".to_vec(),
+                });
+            }
+
+            let stdout = match program {
+                "tpm2_pcrread" => {
+                    let digest = hex_encode(&*self.pcr.borrow());
+                    format!("sha256:\n  23: 0x{digest}\n").into_bytes()
+                }
+                "tpm2_pcrreset" => {
+                    *self.pcr.borrow_mut() = [0u8; 32];
+                    Vec::new()
+                }
+                "tpm2_pcrextend" => {
+                    let digest_hex = args
+                        .first()
+                        .and_then(|arg| arg.split_once('=').map(|(_, digest)| digest))
+                        .ok_or_else(|| anyhow!("mock TPM extend missing digest argument"))?;
+                    let digest = runtime_monitor_common::hex_decode_32(digest_hex)?;
+                    let current = *self.pcr.borrow();
+                    *self.pcr.borrow_mut() =
+                        runtime_monitor_common::replay_pcr_extend(current, digest);
+                    Vec::new()
+                }
+                _ => Vec::new(),
+            };
+
+            Ok(Output {
+                status: ExitStatus::from_raw(0),
+                stdout,
+                stderr: Vec::new(),
+            })
+        }
+    }
+
+    fn disabled_tpm_config() -> tpm::TpmConfig {
+        tpm::TpmConfig::from_policy_and_local_options(
+            &AttestationPolicy::default(),
+            tpm::TpmLocalOptions::default(),
+        )
+        .expect("disabled tpm config")
+    }
+
+    fn tpm_runtime_policy(fail_on_tpm_error: bool) -> RuntimePolicy {
+        RuntimePolicy {
+            attestation: AttestationPolicy {
+                backend: String::from("tpm"),
+                mode: String::from("final-summary"),
+                runtime_pcr: Some(23),
+                hash_bank: Some(String::from("sha256")),
+                fail_on_tpm_error: Some(fail_on_tpm_error),
+                ..AttestationPolicy::default()
+            },
+            ..RuntimePolicy::default()
+        }
+    }
+
+    fn enabled_tpm_config(policy: &RuntimePolicy, reset_pcr: bool) -> tpm::TpmConfig {
+        tpm::TpmConfig::from_policy_and_local_options(
+            &policy.attestation,
+            tpm::TpmLocalOptions {
+                reset_pcr,
+                ..tpm::TpmLocalOptions::default()
+            },
+        )
+        .expect("enabled tpm config")
+    }
 
     fn state_with_counts(suspicious_count: u64, denied_count: u64) -> RuntimeEvidenceState {
         let mut state = RuntimeEvidenceState::new([1u8; 32]);
@@ -1130,6 +1435,7 @@ mod tests {
             CollectionMode::Scoped,
             RuntimePolicy::default(),
             PolicySource::Configured,
+            disabled_tpm_config(),
         )
         .expect("evidence capture");
 
@@ -1137,7 +1443,7 @@ mod tests {
             .write_workload_target_bound(&workloads)
             .expect("target bound");
         evidence
-            .write_summary(&MonitorState { seq: 0, lost: 0 })
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &NoopTpmRunner)
             .expect("summary");
 
         assert_eq!(evidence.capture_state, EvidenceCaptureState::Finalized);
@@ -1175,6 +1481,8 @@ mod tests {
         assert_eq!(summary.event_count, 0);
         assert_eq!(summary.synthetic_record_count, 4);
         assert_eq!(summary.software_chain_head, final_chain_head);
+        assert!(summary.tpm.is_none());
+        assert!(summary.final_summary_digest.is_none());
 
         let _ = fs::remove_file(evidence_out);
         let _ = fs::remove_file(summary_out);
@@ -1191,6 +1499,7 @@ mod tests {
             CollectionMode::Scoped,
             RuntimePolicy::default(),
             PolicySource::Configured,
+            disabled_tpm_config(),
         )
         .expect("evidence capture");
 
@@ -1202,7 +1511,7 @@ mod tests {
             .process_sample(bytemuck::bytes_of(&event), &workloads)
             .expect("runtime sample");
         evidence
-            .write_summary(&MonitorState { seq: 1, lost: 0 })
+            .write_summary(&MonitorState { seq: 1, lost: 0 }, &NoopTpmRunner)
             .expect("summary");
 
         let records = read_evidence_records(&evidence_out);
@@ -1258,6 +1567,7 @@ mod tests {
             CollectionMode::Scoped,
             RuntimePolicy::default(),
             PolicySource::Configured,
+            disabled_tpm_config(),
         )
         .expect("evidence capture");
 
@@ -1265,14 +1575,15 @@ mod tests {
             .write_workload_target_bound(&workloads)
             .expect("target bound");
         evidence
-            .write_summary(&MonitorState { seq: 0, lost: 0 })
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &NoopTpmRunner)
             .expect("summary");
         assert_eq!(evidence.capture_state, EvidenceCaptureState::Finalized);
 
         let records_after_summary = read_evidence_records(&evidence_out);
         assert_eq!(records_after_summary.len(), 4);
 
-        let second_summary = evidence.write_summary(&MonitorState { seq: 0, lost: 0 });
+        let second_summary =
+            evidence.write_summary(&MonitorState { seq: 0, lost: 0 }, &NoopTpmRunner);
         assert!(second_summary.is_err());
         assert_eq!(read_evidence_records(&evidence_out).len(), 4);
 
@@ -1314,13 +1625,15 @@ mod tests {
             CollectionMode::Scoped,
             RuntimePolicy::default(),
             PolicySource::Configured,
+            disabled_tpm_config(),
         )
         .expect("evidence capture");
 
         evidence
             .write_workload_target_bound(&workloads)
             .expect("target bound");
-        let failed_summary = evidence.write_summary(&MonitorState { seq: 0, lost: 0 });
+        let failed_summary =
+            evidence.write_summary(&MonitorState { seq: 0, lost: 0 }, &NoopTpmRunner);
         assert!(failed_summary.is_err());
         assert_eq!(evidence.capture_state, EvidenceCaptureState::StopWritten);
 
@@ -1329,7 +1642,7 @@ mod tests {
 
         evidence.summary_out = summary_out.clone();
         evidence
-            .write_summary(&MonitorState { seq: 0, lost: 0 })
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &NoopTpmRunner)
             .expect("summary retry");
         assert_eq!(evidence.capture_state, EvidenceCaptureState::Finalized);
 
@@ -1362,6 +1675,276 @@ mod tests {
     }
 
     #[test]
+    fn summary_write_retry_after_final_tpm_extend_reuses_cached_tpm_summary() {
+        let (evidence_out, summary_out) = temp_output_paths("tpm-summary-retry");
+        let bad_summary_out = evidence_out.join("runtime_summary.json");
+        let workloads = test_workloads();
+        let policy = tpm_runtime_policy(true);
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            bad_summary_out,
+            &workloads,
+            CollectionMode::Scoped,
+            policy.clone(),
+            PolicySource::Configured,
+            enabled_tpm_config(&policy, true),
+        )
+        .expect("evidence capture");
+        let runner = MockTpmRunner::new([0u8; 32]);
+
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+        evidence
+            .bind_tpm_session_start(&runner)
+            .expect("session-start binding");
+
+        let failed_summary = evidence.write_summary(&MonitorState { seq: 0, lost: 0 }, &runner);
+        assert!(failed_summary.is_err());
+        assert_eq!(evidence.capture_state, EvidenceCaptureState::StopWritten);
+        let cached_tpm_summary = evidence
+            .tpm_final_summary
+            .clone()
+            .expect("cached final TPM metadata");
+        let extend_calls_after_failure = runner
+            .calls()
+            .iter()
+            .filter(|call| call.program == "tpm2_pcrextend")
+            .count();
+        assert_eq!(extend_calls_after_failure, 2);
+
+        evidence.summary_out = summary_out.clone();
+        evidence
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &runner)
+            .expect("summary retry");
+
+        let extend_calls_after_retry = runner
+            .calls()
+            .iter()
+            .filter(|call| call.program == "tpm2_pcrextend")
+            .count();
+        let summary = serde_json::from_str::<RuntimeSummary>(
+            &fs::read_to_string(&summary_out).expect("summary"),
+        )
+        .expect("runtime summary");
+
+        assert_eq!(extend_calls_after_retry, 2);
+        assert_eq!(summary.tpm.as_ref(), Some(&cached_tpm_summary));
+        assert_eq!(
+            summary.final_summary_digest.as_deref(),
+            Some(cached_tpm_summary.final_summary_digest.as_str())
+        );
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_out);
+    }
+
+    #[test]
+    fn tpm_enabled_binds_session_and_final_summary_with_mock_runner() {
+        let (evidence_out, summary_out) = temp_output_paths("tpm-enabled");
+        let workloads = test_workloads();
+        let policy = tpm_runtime_policy(true);
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            summary_out.clone(),
+            &workloads,
+            CollectionMode::Scoped,
+            policy.clone(),
+            PolicySource::Configured,
+            enabled_tpm_config(&policy, true),
+        )
+        .expect("evidence capture");
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+
+        let initial_pcr = [0u8; 32];
+        let session_digest = session_start_digest(
+            &evidence.state.session_id,
+            evidence.policy_hash,
+            &evidence.summary_workload_id,
+            evidence.collection_mode.as_str(),
+        );
+        let after_session_start_pcr =
+            runtime_monitor_common::replay_pcr_extend(initial_pcr, session_digest);
+        let runner = MockTpmRunner::new(initial_pcr);
+
+        evidence
+            .bind_tpm_session_start(&runner)
+            .expect("session-start binding");
+        evidence
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &runner)
+            .expect("summary");
+
+        let summary = serde_json::from_str::<RuntimeSummary>(
+            &fs::read_to_string(&summary_out).expect("summary"),
+        )
+        .expect("runtime summary");
+        let records = read_evidence_records(&evidence_out);
+        let EvidenceRecord::Synthetic(stop) = records.last().expect("monitor-stop") else {
+            panic!("expected monitor-stop");
+        };
+        let summary_chain_head =
+            runtime_monitor_common::hex_decode_32(&summary.software_chain_head).expect("chain");
+        let expected_final_digest = final_summary_digest(
+            &evidence.state.session_id,
+            summary_chain_head,
+            summary.event_count,
+            summary.synthetic_record_count,
+            summary.acceptable_count,
+            summary.suspicious_count,
+            summary.denied_count,
+            summary.dropped_events,
+            policy_hash(&policy),
+        );
+        let expected_final_pcr = runtime_monitor_common::replay_pcr_extend(
+            after_session_start_pcr,
+            expected_final_digest,
+        );
+        let tpm_summary = summary.tpm.as_ref().expect("tpm summary");
+
+        assert_eq!(summary.software_chain_head, stop.software_chain_head);
+        assert_eq!(
+            summary.final_summary_digest.as_deref(),
+            Some(hex_encode(&expected_final_digest).as_str())
+        );
+        assert_eq!(
+            tpm_summary.initial_pcr.as_deref(),
+            Some(hex_encode(&initial_pcr).as_str())
+        );
+        assert_eq!(
+            tpm_summary.after_session_start_pcr.as_deref(),
+            Some(hex_encode(&after_session_start_pcr).as_str())
+        );
+        assert_eq!(
+            tpm_summary.final_pcr.as_deref(),
+            Some(hex_encode(&expected_final_pcr).as_str())
+        );
+        assert_eq!(
+            tpm_summary.session_start_digest,
+            hex_encode(&session_digest)
+        );
+        assert_eq!(
+            tpm_summary.final_summary_digest,
+            hex_encode(&expected_final_digest)
+        );
+        assert_eq!(tpm_summary.reset_pcr, true);
+
+        assert_eq!(
+            runner.calls(),
+            vec![
+                MockTpmCall {
+                    program: String::from("tpm2_pcrreset"),
+                    args: vec![String::from("23")]
+                },
+                MockTpmCall {
+                    program: String::from("tpm2_pcrread"),
+                    args: vec![String::from("sha256:23")]
+                },
+                MockTpmCall {
+                    program: String::from("tpm2_pcrextend"),
+                    args: vec![format!("23:sha256={}", hex_encode(&session_digest))]
+                },
+                MockTpmCall {
+                    program: String::from("tpm2_pcrread"),
+                    args: vec![String::from("sha256:23")]
+                },
+                MockTpmCall {
+                    program: String::from("tpm2_pcrextend"),
+                    args: vec![format!("23:sha256={}", hex_encode(&expected_final_digest))]
+                },
+                MockTpmCall {
+                    program: String::from("tpm2_pcrread"),
+                    args: vec![String::from("sha256:23")]
+                },
+            ]
+        );
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_out);
+    }
+
+    #[test]
+    fn tpm_failure_fails_closed_when_policy_requires_it() {
+        let (evidence_out, summary_out) = temp_output_paths("tpm-fail-closed");
+        let workloads = test_workloads();
+        let policy = tpm_runtime_policy(true);
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            summary_out.clone(),
+            &workloads,
+            CollectionMode::Scoped,
+            policy.clone(),
+            PolicySource::Configured,
+            enabled_tpm_config(&policy, false),
+        )
+        .expect("evidence capture");
+        let runner = MockTpmRunner::failing("tpm2_pcrread");
+
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+        let error = evidence
+            .bind_tpm_session_start(&runner)
+            .expect_err("TPM failure should fail closed");
+
+        assert!(
+            error
+                .to_string()
+                .contains("TPM session-start binding failed")
+        );
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_out);
+    }
+
+    #[test]
+    fn tpm_failure_can_fail_open_without_success_metadata() {
+        let (evidence_out, summary_out) = temp_output_paths("tpm-fail-open");
+        let workloads = test_workloads();
+        let policy = tpm_runtime_policy(false);
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            summary_out.clone(),
+            &workloads,
+            CollectionMode::Scoped,
+            policy.clone(),
+            PolicySource::Configured,
+            enabled_tpm_config(&policy, false),
+        )
+        .expect("evidence capture");
+        let runner = MockTpmRunner::failing("tpm2_pcrread");
+
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+        evidence
+            .bind_tpm_session_start(&runner)
+            .expect("TPM failure should fail open");
+        evidence
+            .write_summary(&MonitorState { seq: 0, lost: 0 }, &NoopTpmRunner)
+            .expect("summary");
+
+        let summary = serde_json::from_str::<RuntimeSummary>(
+            &fs::read_to_string(&summary_out).expect("summary"),
+        )
+        .expect("runtime summary");
+
+        assert_eq!(summary.attestation_status, "warning");
+        assert!(
+            summary
+                .failure_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("TPM binding failed open"))
+        );
+        assert!(summary.tpm.is_none());
+        assert!(summary.final_summary_digest.is_none());
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_out);
+    }
+
+    #[test]
     fn policy_loaded_reason_records_policy_source() {
         let (evidence_out, summary_out) = temp_output_paths("policy-source");
         let workloads = test_workloads();
@@ -1372,6 +1955,7 @@ mod tests {
             CollectionMode::Scoped,
             RuntimePolicy::default(),
             PolicySource::Defaulted,
+            disabled_tpm_config(),
         )
         .expect("evidence capture");
 
