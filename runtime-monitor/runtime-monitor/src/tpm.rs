@@ -3,7 +3,7 @@
 use anyhow::{Result, anyhow};
 use std::process::{Command, Output};
 
-use runtime_monitor_common::AttestationPolicy;
+use runtime_monitor_common::{AttestationPolicy, EventClassification};
 
 const SUPPORTED_HASH_BANK: &str = "sha256";
 const SUPPORTED_MODES: &[&str] = &["software-chain", "final-summary", "policy-triggered"];
@@ -19,9 +19,11 @@ pub struct TpmLocalOptions {
 pub struct TpmConfig {
     pub enabled: bool,
     pub tcti: Option<String>,
+    pub mode: String,
     pub hash_bank: String,
     pub runtime_pcr: Option<u32>,
     pub reset_pcr: bool,
+    pub extend_on: Vec<EventClassification>,
     pub fail_on_tpm_error: bool,
 }
 
@@ -62,7 +64,8 @@ impl TpmConfig {
         local: TpmLocalOptions,
     ) -> Result<Self> {
         let backend = normalize_field(&policy.backend, "attestation.backend")?;
-        let _mode = validate_mode(&policy.mode)?;
+        let mode = validate_mode(&policy.mode)?;
+        let extend_on = validate_extend_on(&policy.extend_on, &backend, &mode)?;
         let tcti = normalize_optional_local_string(local.tcti);
         let reset_pcr = local.reset_pcr;
 
@@ -70,9 +73,11 @@ impl TpmConfig {
             "none" => Ok(Self {
                 enabled: false,
                 tcti,
+                mode,
                 hash_bank: default_hash_bank(policy),
                 runtime_pcr: None,
                 reset_pcr,
+                extend_on,
                 fail_on_tpm_error: policy.fail_on_tpm_error.unwrap_or(false),
             }),
             "tpm" => {
@@ -85,9 +90,11 @@ impl TpmConfig {
                 Ok(Self {
                     enabled: true,
                     tcti,
+                    mode,
                     hash_bank,
                     runtime_pcr: Some(runtime_pcr),
                     reset_pcr,
+                    extend_on,
                     fail_on_tpm_error: policy.fail_on_tpm_error.unwrap_or(true),
                 })
             }
@@ -96,6 +103,14 @@ impl TpmConfig {
                 policy.backend
             )),
         }
+    }
+
+    pub fn is_policy_triggered(&self) -> bool {
+        self.enabled && self.mode == "policy-triggered"
+    }
+
+    pub fn should_extend_classification(&self, classification: EventClassification) -> bool {
+        self.is_policy_triggered() && self.extend_on.contains(&classification)
     }
 
     fn runtime_pcr_for_command(&self, operation: &str) -> Result<u32> {
@@ -212,6 +227,48 @@ fn validate_mode(mode: &str) -> Result<String> {
         "unsupported attestation.mode `{mode}`; expected one of {}",
         SUPPORTED_MODES.join(", ")
     ))
+}
+
+fn validate_extend_on(
+    values: &[String],
+    backend: &str,
+    mode: &str,
+) -> Result<Vec<EventClassification>> {
+    let mut extend_on = Vec::new();
+    for value in values {
+        let value = normalize_field(value, "attestation.extend_on")?;
+        let classification = match value.as_str() {
+            "acceptable" => EventClassification::Acceptable,
+            "suspicious" => EventClassification::Suspicious,
+            "denied" => EventClassification::Denied,
+            _ => {
+                return Err(anyhow!(
+                    "unsupported attestation.extend_on value `{value}`; expected one of acceptable, suspicious, denied"
+                ));
+            }
+        };
+
+        if extend_on.contains(&classification) {
+            return Err(anyhow!(
+                "duplicate attestation.extend_on value `{value}` is not allowed"
+            ));
+        }
+        extend_on.push(classification);
+    }
+
+    if !extend_on.is_empty() && (backend != "tpm" || mode != "policy-triggered") {
+        return Err(anyhow!(
+            "attestation.extend_on is only supported when backend is `tpm` and mode is `policy-triggered`"
+        ));
+    }
+
+    if backend == "tpm" && mode == "policy-triggered" && extend_on.is_empty() {
+        return Err(anyhow!(
+            "attestation.extend_on must not be empty when backend is `tpm` and mode is `policy-triggered`"
+        ));
+    }
+
+    Ok(extend_on)
 }
 
 fn default_hash_bank(policy: &AttestationPolicy) -> String {
@@ -359,7 +416,9 @@ mod tests {
 
         assert!(!config.enabled);
         assert_eq!(config.runtime_pcr, None);
+        assert_eq!(config.mode, "software-chain");
         assert_eq!(config.hash_bank, "sha256");
+        assert!(config.extend_on.is_empty());
     }
 
     #[test]
@@ -368,7 +427,9 @@ mod tests {
 
         assert!(config.enabled);
         assert_eq!(config.runtime_pcr, Some(23));
+        assert_eq!(config.mode, "software-chain");
         assert_eq!(config.hash_bank, "sha256");
+        assert!(config.extend_on.is_empty());
         assert!(config.fail_on_tpm_error);
     }
 
@@ -377,6 +438,9 @@ mod tests {
         for mode in SUPPORTED_MODES {
             let mut policy = tpm_policy();
             policy.mode = (*mode).to_owned();
+            if *mode == "policy-triggered" {
+                policy.extend_on = vec![String::from("suspicious")];
+            }
 
             let config =
                 TpmConfig::from_policy_and_local_options(&policy, TpmLocalOptions::default())
@@ -384,6 +448,102 @@ mod tests {
 
             assert!(config.enabled);
         }
+    }
+
+    #[test]
+    fn final_summary_mode_allows_empty_extend_on() {
+        let mut policy = tpm_policy();
+        policy.mode = String::from("final-summary");
+
+        let config = TpmConfig::from_policy_and_local_options(&policy, TpmLocalOptions::default())
+            .expect("final summary mode");
+
+        assert!(config.enabled);
+        assert_eq!(config.mode, "final-summary");
+        assert!(config.extend_on.is_empty());
+    }
+
+    #[test]
+    fn policy_triggered_mode_requires_extend_on() {
+        let mut policy = tpm_policy();
+        policy.mode = String::from("policy-triggered");
+
+        let error = TpmConfig::from_policy_and_local_options(&policy, TpmLocalOptions::default())
+            .expect_err("empty extend_on should fail");
+
+        assert!(error.to_string().contains("extend_on"));
+    }
+
+    #[test]
+    fn policy_triggered_mode_accepts_supported_extend_on_values() {
+        let mut policy = tpm_policy();
+        policy.mode = String::from("policy-triggered");
+        policy.extend_on = vec![
+            String::from("suspicious"),
+            String::from("denied"),
+            String::from("acceptable"),
+        ];
+
+        let config = TpmConfig::from_policy_and_local_options(&policy, TpmLocalOptions::default())
+            .expect("policy triggered config");
+
+        assert_eq!(
+            config.extend_on,
+            vec![
+                EventClassification::Suspicious,
+                EventClassification::Denied,
+                EventClassification::Acceptable,
+            ]
+        );
+        assert!(config.should_extend_classification(EventClassification::Suspicious));
+        assert!(config.should_extend_classification(EventClassification::Denied));
+        assert!(config.should_extend_classification(EventClassification::Acceptable));
+    }
+
+    #[test]
+    fn non_empty_extend_on_is_rejected_unless_policy_triggered_tpm() {
+        let mut final_summary_policy = tpm_policy();
+        final_summary_policy.mode = String::from("final-summary");
+        final_summary_policy.extend_on = vec![String::from("suspicious")];
+
+        let error = TpmConfig::from_policy_and_local_options(
+            &final_summary_policy,
+            TpmLocalOptions::default(),
+        )
+        .expect_err("extend_on should fail in final-summary mode");
+        assert!(error.to_string().contains("policy-triggered"));
+
+        let mut disabled_policy = AttestationPolicy {
+            extend_on: vec![String::from("suspicious")],
+            mode: String::from("policy-triggered"),
+            ..AttestationPolicy::default()
+        };
+        disabled_policy.backend = String::from("none");
+
+        let error =
+            TpmConfig::from_policy_and_local_options(&disabled_policy, TpmLocalOptions::default())
+                .expect_err("extend_on should fail when backend is disabled");
+        assert!(error.to_string().contains("backend"));
+    }
+
+    #[test]
+    fn unknown_or_duplicate_extend_on_values_are_rejected() {
+        let mut unknown = tpm_policy();
+        unknown.mode = String::from("policy-triggered");
+        unknown.extend_on = vec![String::from("critical")];
+
+        let error = TpmConfig::from_policy_and_local_options(&unknown, TpmLocalOptions::default())
+            .expect_err("unknown extend_on should fail");
+        assert!(error.to_string().contains("extend_on"));
+
+        let mut duplicate = tpm_policy();
+        duplicate.mode = String::from("policy-triggered");
+        duplicate.extend_on = vec![String::from("denied"), String::from("denied")];
+
+        let error =
+            TpmConfig::from_policy_and_local_options(&duplicate, TpmLocalOptions::default())
+                .expect_err("duplicate extend_on should fail");
+        assert!(error.to_string().contains("duplicate"));
     }
 
     #[test]

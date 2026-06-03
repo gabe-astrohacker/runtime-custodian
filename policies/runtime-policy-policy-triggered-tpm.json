@@ -1,0 +1,35 @@
+{
+  "workload_id": "fastapi-echo",
+  "profile_mode": "minimal-behaviour",
+  "acceptable": {
+    "exec_paths": [
+      "/usr/local/bin/python",
+      "/usr/bin/echo"
+    ],
+    "event_types": [
+      "fork"
+    ]
+  },
+  "suspicious": {
+    "unknown_exec_path": true
+  },
+  "denied": {
+    "exec_paths": [
+      "/usr/bin/id",
+      "/bin/sh",
+      "/bin/bash"
+    ],
+    "comm_names": []
+  },
+  "attestation": {
+    "backend": "tpm",
+    "mode": "policy-triggered",
+    "runtime_pcr": 23,
+    "hash_bank": "sha256",
+    "extend_on": [
+      "suspicious",
+      "denied"
+    ],
+    "fail_on_tpm_error": true
+  }
+}

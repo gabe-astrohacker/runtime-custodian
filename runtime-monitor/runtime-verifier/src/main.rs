@@ -7,10 +7,13 @@ use std::path::{Path, PathBuf};
 use runtime_monitor_common::evidence::{RUNTIME_SUMMARY_SCHEMA_VERSION, RuntimeEvidenceState};
 use runtime_monitor_common::{
     EventClassification, EvidenceEvent, EvidenceRecord, EvidenceSyntheticRecord, RuntimeEvent,
-    RuntimePolicy, RuntimeSummary, SyntheticRecordType, classify_event, event_hash,
-    final_summary_digest, hex_decode_32, hex_encode, policy_hash, replay_pcr_extend,
+    RuntimePolicy, RuntimeSummary, SyntheticRecordType, classified_tpm_digest, classify_event,
+    event_hash, final_summary_digest, hex_decode_32, hex_encode, policy_hash, replay_pcr_extend,
     session_start_digest, synthetic_record_hash,
 };
+
+const SUPPORTED_ATTESTATION_MODES: &[&str] =
+    &["software-chain", "final-summary", "policy-triggered"];
 
 #[derive(Debug)]
 struct Args {
@@ -272,6 +275,9 @@ fn verify_replay(
     let mut first_denied_event = None;
     let mut structural_reasons = Vec::new();
     let mut lifecycle = LifecycleState::default();
+    let tpm_event_policy = tpm_event_policy(policy, &mut checks, &mut structural_reasons);
+    let enforce_tpm_event_extends = summary.tpm.is_some();
+    let mut tpm_event_replay = TpmEventReplayState::default();
 
     if summary.schema_version != RUNTIME_SUMMARY_SCHEMA_VERSION {
         checks.schema_valid = false;
@@ -383,6 +389,9 @@ fn verify_replay(
                     &mut structural_reasons,
                     &mut first_suspicious_event,
                     &mut first_denied_event,
+                    &tpm_event_policy,
+                    enforce_tpm_event_extends,
+                    &mut tpm_event_replay,
                 );
             }
             EvidenceRecord::Synthetic(record) => {
@@ -442,6 +451,7 @@ fn verify_replay(
         session_id,
         expected_policy_hash,
         &state,
+        &tpm_event_replay,
         &mut checks,
         &mut structural_reasons,
     );
@@ -478,6 +488,39 @@ struct LifecycleState {
     seen_stop: bool,
 }
 
+#[derive(Default)]
+struct TpmEventReplayState {
+    digests: Vec<[u8; 32]>,
+    next_extend_index: u64,
+}
+
+impl TpmEventReplayState {
+    fn expected_next_index(&self) -> u64 {
+        self.next_extend_index + 1
+    }
+
+    fn observe_extend(&mut self, digest: [u8; 32]) {
+        self.next_extend_index += 1;
+        self.digests.push(digest);
+    }
+}
+
+struct TpmEventPolicy {
+    backend_is_tpm: bool,
+    mode: String,
+    extend_on: Vec<EventClassification>,
+}
+
+impl TpmEventPolicy {
+    fn is_policy_triggered_tpm(&self) -> bool {
+        self.backend_is_tpm && self.mode == "policy-triggered"
+    }
+
+    fn requires_extend(&self, classification: EventClassification) -> bool {
+        self.is_policy_triggered_tpm() && self.extend_on.contains(&classification)
+    }
+}
+
 fn replay_runtime_event(
     event: &EvidenceEvent,
     policy: &RuntimePolicy,
@@ -486,15 +529,10 @@ fn replay_runtime_event(
     structural_reasons: &mut Vec<String>,
     first_suspicious_event: &mut Option<ReportEvent>,
     first_denied_event: &mut Option<ReportEvent>,
+    tpm_event_policy: &TpmEventPolicy,
+    enforce_tpm_event_extends: bool,
+    tpm_event_replay: &mut TpmEventReplayState,
 ) {
-    if event.tpm_extended || event.tpm_extend_index.is_some() {
-        checks.tpm_metadata_valid = false;
-        structural_reasons.push(format!(
-            "per-event TPM metadata is not supported until the policy-triggered TPM stage at seq_no {}: tpm_extended={} tpm_extend_index={:?}",
-            event.seq_no, event.tpm_extended, event.tpm_extend_index
-        ));
-    }
-
     let recomputed_event_hash = event_hash(&state.session_id, event.seq_no, &event.event);
     match decode_hex_32_field(
         &event.event_hash,
@@ -531,6 +569,19 @@ fn replay_runtime_event(
         ));
     }
 
+    validate_event_tpm_metadata(
+        event,
+        &state.session_id,
+        recomputed_event_hash,
+        recomputed_classification.classification,
+        &recomputed_classification.rule_id,
+        tpm_event_policy,
+        enforce_tpm_event_extends,
+        tpm_event_replay,
+        checks,
+        structural_reasons,
+    );
+
     let software_chain_head = state.update_chain(recomputed_event_hash);
     compare_chain_head(
         &event.software_chain_head,
@@ -566,6 +617,88 @@ fn replay_runtime_event(
             });
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_event_tpm_metadata(
+    event: &EvidenceEvent,
+    session_id: &[u8; 32],
+    recomputed_event_hash: [u8; 32],
+    recomputed_classification: EventClassification,
+    recomputed_rule_id: &str,
+    tpm_event_policy: &TpmEventPolicy,
+    enforce_tpm_event_extends: bool,
+    tpm_event_replay: &mut TpmEventReplayState,
+    checks: &mut VerificationChecks,
+    structural_reasons: &mut Vec<String>,
+) {
+    if event.tpm_extend_index.is_some() && !event.tpm_extended {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(format!(
+            "tpm_extend_index is present but tpm_extended is false at seq_no {}",
+            event.seq_no
+        ));
+    }
+
+    if event.tpm_extended && !tpm_event_policy.is_policy_triggered_tpm() {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(format!(
+            "per-event TPM metadata at seq_no {} requires attestation.backend `tpm` and mode `policy-triggered`; got backend_tpm={} mode={}",
+            event.seq_no, tpm_event_policy.backend_is_tpm, tpm_event_policy.mode
+        ));
+        return;
+    }
+
+    let expected_extend = tpm_event_policy.requires_extend(recomputed_classification);
+    if event.tpm_extended && !expected_extend {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(format!(
+            "unexpected per-event TPM metadata at seq_no {} for classification {:?}",
+            event.seq_no, recomputed_classification
+        ));
+        return;
+    }
+
+    if enforce_tpm_event_extends && expected_extend && !event.tpm_extended {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(format!(
+            "missing required per-event TPM extend at seq_no {} for classification {:?}",
+            event.seq_no, recomputed_classification
+        ));
+        return;
+    }
+
+    if !event.tpm_extended {
+        return;
+    }
+
+    let Some(tpm_extend_index) = event.tpm_extend_index else {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(format!(
+            "missing tpm_extend_index for extended event at seq_no {}",
+            event.seq_no
+        ));
+        return;
+    };
+
+    let expected_index = tpm_event_replay.expected_next_index();
+    if tpm_extend_index != expected_index {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(format!(
+            "non-contiguous tpm_extend_index at seq_no {}: expected {} got {}",
+            event.seq_no, expected_index, tpm_extend_index
+        ));
+        return;
+    }
+
+    let digest = classified_tpm_digest(
+        session_id,
+        event.seq_no,
+        recomputed_event_hash,
+        recomputed_classification,
+        recomputed_rule_id,
+    );
+    tpm_event_replay.observe_extend(digest);
 }
 
 fn replay_synthetic_record(
@@ -735,6 +868,7 @@ fn validate_tpm_summary(
     session_id: [u8; 32],
     policy_hash_bytes: [u8; 32],
     state: &RuntimeEvidenceState,
+    tpm_event_replay: &TpmEventReplayState,
     checks: &mut VerificationChecks,
     structural_reasons: &mut Vec<String>,
 ) {
@@ -808,6 +942,15 @@ fn validate_tpm_summary(
         structural_reasons.push(format!(
             "TPM summary runtime_pcr must be in range 0..=23, got {}",
             tpm_summary.runtime_pcr
+        ));
+    }
+
+    let expected_event_extend_count = tpm_event_replay.digests.len() as u64;
+    if tpm_summary.event_extend_count != expected_event_extend_count {
+        checks.tpm_summary_valid = false;
+        structural_reasons.push(format!(
+            "TPM summary event_extend_count mismatch: expected {} got {}",
+            expected_event_extend_count, tpm_summary.event_extend_count
         ));
     }
 
@@ -925,8 +1068,12 @@ fn validate_tpm_summary(
             ));
         }
 
-        let expected_final_pcr =
-            replay_pcr_extend(expected_after_session, recorded_final_summary_digest);
+        let mut expected_pcr = expected_after_session;
+        for digest in &tpm_event_replay.digests {
+            expected_pcr = replay_pcr_extend(expected_pcr, *digest);
+        }
+
+        let expected_final_pcr = replay_pcr_extend(expected_pcr, recorded_final_summary_digest);
         if expected_final_pcr != final_pcr {
             checks.tpm_pcr_replay_valid = false;
             structural_reasons.push(format!(
@@ -942,6 +1089,77 @@ fn normalized_attestation_backend(policy: &RuntimePolicy) -> String {
     policy.attestation.backend.trim().to_ascii_lowercase()
 }
 
+fn tpm_event_policy(
+    policy: &RuntimePolicy,
+    checks: &mut VerificationChecks,
+    structural_reasons: &mut Vec<String>,
+) -> TpmEventPolicy {
+    let backend = normalized_attestation_backend(policy);
+    let backend_is_tpm = backend == "tpm";
+    let mode = policy.attestation.mode.trim().to_ascii_lowercase();
+    let mut extend_on = Vec::new();
+
+    if backend != "none" && backend != "tpm" {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(format!(
+            "unsupported attestation.backend `{}`; expected `none` or `tpm`",
+            policy.attestation.backend
+        ));
+    }
+    if !SUPPORTED_ATTESTATION_MODES.contains(&mode.as_str()) {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(format!(
+            "unsupported attestation.mode `{}`; expected one of {}",
+            policy.attestation.mode,
+            SUPPORTED_ATTESTATION_MODES.join(", ")
+        ));
+    }
+
+    for value in &policy.attestation.extend_on {
+        let value = value.trim().to_ascii_lowercase();
+        let classification = match value.as_str() {
+            "acceptable" => EventClassification::Acceptable,
+            "suspicious" => EventClassification::Suspicious,
+            "denied" => EventClassification::Denied,
+            _ => {
+                checks.tpm_metadata_valid = false;
+                structural_reasons
+                    .push(format!("unsupported attestation.extend_on value `{value}`"));
+                continue;
+            }
+        };
+
+        if extend_on.contains(&classification) {
+            checks.tpm_metadata_valid = false;
+            structural_reasons.push(format!(
+                "duplicate attestation.extend_on value `{value}` is not allowed"
+            ));
+            continue;
+        }
+        extend_on.push(classification);
+    }
+
+    if !extend_on.is_empty() && (!backend_is_tpm || mode != "policy-triggered") {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(String::from(
+            "attestation.extend_on is only supported when backend is `tpm` and mode is `policy-triggered`",
+        ));
+    }
+
+    if backend_is_tpm && mode == "policy-triggered" && extend_on.is_empty() {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(String::from(
+            "attestation.extend_on must not be empty when backend is `tpm` and mode is `policy-triggered`",
+        ));
+    }
+
+    TpmEventPolicy {
+        backend_is_tpm,
+        mode,
+        extend_on,
+    }
+}
+
 fn expected_policy_hash_bank(policy: &RuntimePolicy) -> String {
     policy
         .attestation
@@ -954,6 +1172,8 @@ fn expected_policy_hash_bank(policy: &RuntimePolicy) -> String {
 }
 
 fn summary_indicates_tpm_failed_open(summary: &RuntimeSummary) -> bool {
+    // Stage 7 compatibility: fail-open TPM sessions are identified by this
+    // marker until the schema grows a structured TPM binding status field.
     summary
         .failure_reason
         .as_deref()
@@ -1279,6 +1499,16 @@ mod tests {
         policy
     }
 
+    fn policy_triggered_tpm_policy(
+        extend_on: Vec<&str>,
+        fail_on_tpm_error: Option<bool>,
+    ) -> RuntimePolicy {
+        let mut policy = tpm_policy(fail_on_tpm_error);
+        policy.attestation.mode = String::from("policy-triggered");
+        policy.attestation.extend_on = extend_on.into_iter().map(String::from).collect();
+        policy
+    }
+
     fn runtime_event(exe_path: &str) -> RuntimeEvent {
         RuntimeEvent {
             workload_index: 0,
@@ -1358,6 +1588,14 @@ mod tests {
     }
 
     fn attach_valid_tpm_summary(policy: &RuntimePolicy, summary: &mut RuntimeSummary) {
+        attach_tpm_summary_for_records(policy, summary, &[]);
+    }
+
+    fn attach_tpm_summary_for_records(
+        policy: &RuntimePolicy,
+        summary: &mut RuntimeSummary,
+        records: &[EvidenceRecord],
+    ) {
         let session_id = hex_decode_32(&summary.session_id).expect("session");
         let policy_hash_bytes = policy_hash(policy);
         let software_chain_head = hex_decode_32(&summary.software_chain_head).expect("chain");
@@ -1380,7 +1618,28 @@ mod tests {
             summary.dropped_events,
             policy_hash_bytes,
         );
-        let final_pcr = replay_pcr_extend(after_session_start_pcr, final_digest);
+        let mut expected_pcr = after_session_start_pcr;
+        let mut event_extend_count = 0u64;
+        for record in records {
+            let EvidenceRecord::RuntimeEvent(event) = record else {
+                continue;
+            };
+            if !event.tpm_extended {
+                continue;
+            }
+
+            event_extend_count += 1;
+            let event_hash = hex_decode_32(&event.event_hash).expect("event hash");
+            let digest = classified_tpm_digest(
+                &session_id,
+                event.seq_no,
+                event_hash,
+                event.classification,
+                &event.rule_id,
+            );
+            expected_pcr = replay_pcr_extend(expected_pcr, digest);
+        }
+        let final_pcr = replay_pcr_extend(expected_pcr, final_digest);
 
         summary.final_summary_digest = Some(hex_encode(&final_digest));
         summary.tpm = Some(TpmSummary {
@@ -1388,12 +1647,21 @@ mod tests {
             hash_bank: String::from("sha256"),
             runtime_pcr: 23,
             reset_pcr: true,
+            event_extend_count,
             initial_pcr: Some(hex_encode(&initial_pcr)),
             after_session_start_pcr: Some(hex_encode(&after_session_start_pcr)),
             final_pcr: Some(hex_encode(&final_pcr)),
             session_start_digest: hex_encode(&session_digest),
             final_summary_digest: hex_encode(&final_digest),
         });
+    }
+
+    fn mark_runtime_tpm_extended(records: &mut [EvidenceRecord], record_idx: usize, index: u64) {
+        let EvidenceRecord::RuntimeEvent(event) = &mut records[record_idx] else {
+            panic!("expected runtime event at index {record_idx}");
+        };
+        event.tpm_extended = true;
+        event.tpm_extend_index = Some(index);
     }
 
     fn verify_fixture(
@@ -1427,6 +1695,64 @@ mod tests {
         assert_eq!(report.decision, VerificationDecision::Accept);
         assert!(report.checks.tpm_summary_valid);
         assert!(report.checks.tpm_pcr_replay_valid);
+    }
+
+    #[test]
+    fn unsupported_attestation_mode_is_invalid_evidence() {
+        let mut policy = tpm_policy(Some(true));
+        policy.attestation.mode = String::from("unknown-mode");
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("attestation.mode"));
+    }
+
+    #[test]
+    fn final_summary_mode_with_empty_extend_on_accepts_valid_tpm_summary() {
+        let mut policy = tpm_policy(Some(true));
+        policy.attestation.extend_on.clear();
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert!(report.checks.tpm_metadata_valid);
+        assert!(report.checks.tpm_summary_valid);
+        assert!(report.checks.tpm_pcr_replay_valid);
+    }
+
+    #[test]
+    fn policy_triggered_mode_with_empty_extend_on_is_invalid_evidence() {
+        let mut policy = tpm_policy(Some(true));
+        policy.attestation.mode = String::from("policy-triggered");
+        policy.attestation.extend_on.clear();
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("extend_on"));
+    }
+
+    #[test]
+    fn non_empty_extend_on_in_final_summary_mode_is_invalid_evidence() {
+        let mut policy = tpm_policy(Some(true));
+        policy.attestation.extend_on = vec![String::from("suspicious")];
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&policy, &mut summary);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("extend_on"));
     }
 
     #[test]
@@ -1573,6 +1899,156 @@ mod tests {
         assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
         assert!(!report.checks.tpm_summary_valid);
         assert!(report.reason.contains("runtime_pcr"));
+    }
+
+    #[test]
+    fn valid_policy_triggered_tpm_event_pcr_replay_accepts() {
+        let policy = policy_triggered_tpm_policy(vec!["suspicious"], Some(true));
+        let (mut events, mut summary) = evidence_fixture(
+            &policy,
+            vec![runtime_event("/tmp/evil-a"), runtime_event("/tmp/evil-b")],
+        );
+        mark_runtime_tpm_extended(&mut events, 3, 1);
+        mark_runtime_tpm_extended(&mut events, 4, 2);
+        attach_tpm_summary_for_records(&policy, &mut summary, &events);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::AcceptWithWarnings);
+        assert!(report.checks.tpm_metadata_valid);
+        assert!(report.checks.tpm_summary_valid);
+        assert!(report.checks.tpm_pcr_replay_valid);
+    }
+
+    #[test]
+    fn missing_expected_event_tpm_extend_is_invalid_evidence() {
+        let policy = policy_triggered_tpm_policy(vec!["suspicious"], Some(true));
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/tmp/evil")]);
+        attach_tpm_summary_for_records(&policy, &mut summary, &events);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(
+            report
+                .reason
+                .contains("missing required per-event TPM extend")
+        );
+    }
+
+    #[test]
+    fn unexpected_event_tpm_extend_is_invalid_evidence() {
+        let policy = policy_triggered_tpm_policy(vec!["suspicious"], Some(true));
+        let (mut events, mut summary) =
+            evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        mark_runtime_tpm_extended(&mut events, 3, 1);
+        attach_tpm_summary_for_records(&policy, &mut summary, &events);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("unexpected per-event TPM metadata"));
+    }
+
+    #[test]
+    fn final_summary_mode_rejects_runtime_tpm_metadata() {
+        let policy = tpm_policy(Some(true));
+        let (mut events, mut summary) =
+            evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        mark_runtime_tpm_extended(&mut events, 3, 1);
+        attach_tpm_summary_for_records(&policy, &mut summary, &events);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("policy-triggered"));
+    }
+
+    #[test]
+    fn missing_event_tpm_extend_index_is_invalid_evidence() {
+        let policy = policy_triggered_tpm_policy(vec!["suspicious"], Some(true));
+        let (mut events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/tmp/evil")]);
+        mark_runtime_tpm_extended(&mut events, 3, 1);
+        let EvidenceRecord::RuntimeEvent(event) = &mut events[3] else {
+            panic!("expected runtime event");
+        };
+        event.tpm_extend_index = None;
+        attach_tpm_summary_for_records(&policy, &mut summary, &events);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("missing tpm_extend_index"));
+    }
+
+    #[test]
+    fn non_contiguous_event_tpm_extend_index_is_invalid_evidence() {
+        let policy = policy_triggered_tpm_policy(vec!["suspicious"], Some(true));
+        let (mut events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/tmp/evil")]);
+        mark_runtime_tpm_extended(&mut events, 3, 2);
+        attach_tpm_summary_for_records(&policy, &mut summary, &events);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("non-contiguous tpm_extend_index"));
+    }
+
+    #[test]
+    fn wrong_event_tpm_pcr_replay_is_invalid_evidence() {
+        let policy = policy_triggered_tpm_policy(vec!["suspicious"], Some(true));
+        let (mut events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/tmp/evil")]);
+        mark_runtime_tpm_extended(&mut events, 3, 1);
+        attach_tpm_summary_for_records(&policy, &mut summary, &events);
+        summary.tpm.as_mut().expect("tpm").final_pcr = Some(hex_encode(&[0xabu8; 32]));
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_pcr_replay_valid);
+    }
+
+    #[test]
+    fn wrong_event_extend_count_is_invalid_evidence() {
+        let policy = policy_triggered_tpm_policy(vec!["suspicious"], Some(true));
+        let (mut events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/tmp/evil")]);
+        mark_runtime_tpm_extended(&mut events, 3, 1);
+        attach_tpm_summary_for_records(&policy, &mut summary, &events);
+        summary.tpm.as_mut().expect("tpm").event_extend_count = 99;
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_summary_valid);
+        assert!(report.reason.contains("event_extend_count"));
+    }
+
+    #[test]
+    fn partial_event_tpm_fail_open_is_software_evidence_with_warning() {
+        let policy = policy_triggered_tpm_policy(vec!["suspicious"], Some(false));
+        let (mut events, mut summary) = evidence_fixture(
+            &policy,
+            vec![runtime_event("/tmp/evil-a"), runtime_event("/tmp/evil-b")],
+        );
+        mark_runtime_tpm_extended(&mut events, 3, 1);
+        summary.attestation_status = String::from("warning");
+        summary.failure_reason = Some(String::from(
+            "TPM binding failed open: TPM event binding failed: mock TPM failure",
+        ));
+        summary.final_summary_digest = None;
+        summary.tpm = None;
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::AcceptWithWarnings);
+        assert!(report.checks.tpm_metadata_valid);
+        assert!(report.checks.tpm_summary_valid);
+        assert!(report.reason.contains("TPM binding failed open"));
     }
 
     #[test]
@@ -1890,5 +2366,19 @@ mod tests {
 
         assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
         assert!(!report.checks.tpm_metadata_valid);
+    }
+
+    #[test]
+    fn unsupported_attestation_backend_is_invalid_evidence() {
+        let mut policy = base_policy();
+        policy.attestation.backend = String::from("weird-backend");
+
+        let (events, summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("unsupported attestation.backend"));
     }
 }

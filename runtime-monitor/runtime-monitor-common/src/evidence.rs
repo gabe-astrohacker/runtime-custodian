@@ -429,6 +429,9 @@ pub struct TpmSummary {
     #[serde(default)]
     pub reset_pcr: bool,
 
+    #[serde(default)]
+    pub event_extend_count: u64,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub initial_pcr: Option<String>,
 
@@ -1119,6 +1122,25 @@ mod tests {
 
         assert_eq!(summary.synthetic_record_count, 0);
         assert!(summary.tpm.is_none());
+    }
+
+    #[test]
+    fn tpm_summary_parses_without_event_extend_count() {
+        let json = r#"{
+            "enabled": true,
+            "hash_bank": "sha256",
+            "runtime_pcr": 23,
+            "reset_pcr": true,
+            "initial_pcr": "0000000000000000000000000000000000000000000000000000000000000000",
+            "after_session_start_pcr": "1111111111111111111111111111111111111111111111111111111111111111",
+            "final_pcr": "2222222222222222222222222222222222222222222222222222222222222222",
+            "session_start_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+            "final_summary_digest": "4444444444444444444444444444444444444444444444444444444444444444"
+        }"#;
+
+        let summary = serde_json::from_str::<TpmSummary>(json).expect("tpm summary");
+
+        assert_eq!(summary.event_extend_count, 0);
     }
 
     #[test]
