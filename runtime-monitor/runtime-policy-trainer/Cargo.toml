@@ -1,0 +1,19 @@
+[package]
+name = "runtime-policy-trainer"
+version = "0.1.0"
+edition.workspace = true
+
+license.workspace = true
+
+[dependencies]
+runtime-monitor-common = { path = "../runtime-monitor-common", features = [
+    "user",
+] }
+
+anyhow = { workspace = true, default-features = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+
+[[bin]]
+name = "runtime-policy-trainer"
+path = "src/main.rs"

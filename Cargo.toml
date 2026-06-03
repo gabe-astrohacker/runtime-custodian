@@ -4,11 +4,13 @@ members = [
     "runtime-monitor/runtime-monitor",
     "runtime-monitor/runtime-monitor-common",
     "runtime-monitor/runtime-monitor-ebpf",
+    "runtime-monitor/runtime-policy-trainer",
     "runtime-monitor/runtime-verifier",
 ]
 default-members = [
     "runtime-monitor/runtime-monitor",
     "runtime-monitor/runtime-monitor-common",
+    "runtime-monitor/runtime-policy-trainer",
     "runtime-monitor/runtime-verifier",
 ]
 

@@ -484,6 +484,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "runtime-policy-trainer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "runtime-monitor-common",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "runtime-verifier"
 version = "0.1.0"
 dependencies = [
