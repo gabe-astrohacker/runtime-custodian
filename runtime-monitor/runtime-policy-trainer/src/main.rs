@@ -1,4 +1,5 @@
 use anyhow::{Result, anyhow};
+use runtime_monitor_common::evidence::RuntimeEventType;
 use runtime_monitor_common::{
     AcceptablePolicy, AttestationPolicy, DeniedPolicy, EvidenceRecord, RuntimeEvent, RuntimePolicy,
     RuntimeSummary, SuspiciousPolicy,
@@ -34,8 +35,20 @@ struct TrainingMetadata {
     observed_executable_counts: BTreeMap<String, u64>,
     observed_comm_counts: BTreeMap<String, u64>,
     observed_event_type_counts: BTreeMap<String, u64>,
+    observed_exec_attempt_invocations: Vec<ObservedInvocation>,
+    observed_interpreter_invocations: Vec<ObservedInvocation>,
     generated_acceptable_exec_paths: Vec<String>,
     generated_acceptable_event_types: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ObservedInvocation {
+    exe_path: String,
+    argv: Vec<String>,
+    count: u64,
+    sessions_seen: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workload_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -134,7 +147,7 @@ fn train_from_paths(args: &Args) -> Result<TrainingOutput> {
 
             if let EvidenceRecord::RuntimeEvent(event) = record {
                 parsed_runtime_events += 1;
-                learner.observe_runtime_event(&event.event);
+                learner.observe_runtime_event(&event.event, &summary.session_id);
             }
         }
 
@@ -163,9 +176,24 @@ struct PolicyLearner {
     total_runtime_event_count: u64,
     skipped_empty_exe_path_count: u64,
     observed_executable_counts: BTreeMap<String, u64>,
+    observed_successful_exec_counts: BTreeMap<String, u64>,
     observed_comm_counts: BTreeMap<String, u64>,
     observed_event_type_counts: BTreeMap<String, u64>,
+    observed_exec_attempt_invocations: BTreeMap<InvocationKey, InvocationStats>,
     learned_workload_ids: BTreeSet<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct InvocationKey {
+    workload_id: Option<String>,
+    exe_path: String,
+    argv: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct InvocationStats {
+    count: u64,
+    sessions_seen: BTreeSet<String>,
 }
 
 impl PolicyLearner {
@@ -175,13 +203,15 @@ impl PolicyLearner {
             total_runtime_event_count: 0,
             skipped_empty_exe_path_count: 0,
             observed_executable_counts: BTreeMap::new(),
+            observed_successful_exec_counts: BTreeMap::new(),
             observed_comm_counts: BTreeMap::new(),
             observed_event_type_counts: BTreeMap::new(),
+            observed_exec_attempt_invocations: BTreeMap::new(),
             learned_workload_ids: BTreeSet::new(),
         }
     }
 
-    fn observe_runtime_event(&mut self, event: &RuntimeEvent) {
+    fn observe_runtime_event(&mut self, event: &RuntimeEvent, session_id: &str) {
         if let Some(filter) = self.workload_id_filter.as_deref()
             && event.workload_id.as_deref() != Some(filter)
         {
@@ -210,6 +240,40 @@ impl PolicyLearner {
         } else {
             increment_count(&mut self.observed_executable_counts, exe_path.to_owned());
         }
+
+        match event.event_type {
+            RuntimeEventType::Exec => {
+                if !exe_path.is_empty() {
+                    increment_count(
+                        &mut self.observed_successful_exec_counts,
+                        exe_path.to_owned(),
+                    );
+                }
+            }
+            RuntimeEventType::ExecAttempt => {
+                self.observe_exec_attempt_invocation(event, session_id);
+            }
+            RuntimeEventType::Fork | RuntimeEventType::Unknown(_) => {}
+        }
+    }
+
+    fn observe_exec_attempt_invocation(&mut self, event: &RuntimeEvent, session_id: &str) {
+        let key = InvocationKey {
+            workload_id: event
+                .workload_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(str::to_owned),
+            exe_path: event.exe_path.trim().to_owned(),
+            argv: event.argv.clone(),
+        };
+        let stats = self
+            .observed_exec_attempt_invocations
+            .entry(key)
+            .or_default();
+        stats.count += 1;
+        stats.sessions_seen.insert(session_id.to_owned());
     }
 
     fn finish(
@@ -225,9 +289,9 @@ impl PolicyLearner {
             ));
         }
 
-        if self.observed_executable_counts.is_empty() {
+        if self.observed_successful_exec_counts.is_empty() {
             return Err(anyhow!(
-                "no non-empty executable paths were observed after filtering; cannot generate acceptable.exec_paths"
+                "no non-empty successful exec paths were observed after filtering; cannot generate acceptable.exec_paths"
             ));
         }
 
@@ -259,12 +323,22 @@ impl PolicyLearner {
             }
         };
 
-        let generated_acceptable_exec_paths: Vec<String> =
-            self.observed_executable_counts.keys().cloned().collect();
+        let generated_acceptable_exec_paths: Vec<String> = self
+            .observed_successful_exec_counts
+            .keys()
+            .cloned()
+            .collect();
         let generated_acceptable_event_types: Vec<String> = self
             .observed_event_type_counts
             .keys()
             .filter(|event_type| event_type.as_str() != "exec-attempt")
+            .cloned()
+            .collect();
+        let observed_exec_attempt_invocations =
+            invocation_map_to_metadata(&self.observed_exec_attempt_invocations);
+        let observed_interpreter_invocations = observed_exec_attempt_invocations
+            .iter()
+            .filter(|invocation| is_interpreter_invocation(invocation))
             .cloned()
             .collect();
 
@@ -273,6 +347,7 @@ impl PolicyLearner {
             acceptable: AcceptablePolicy {
                 exec_paths: generated_acceptable_exec_paths.clone(),
                 event_types: generated_acceptable_event_types.clone(),
+                ..AcceptablePolicy::default()
             },
             suspicious: SuspiciousPolicy {
                 unknown_exec_path: true,
@@ -296,12 +371,59 @@ impl PolicyLearner {
             observed_executable_counts: self.observed_executable_counts,
             observed_comm_counts: self.observed_comm_counts,
             observed_event_type_counts: self.observed_event_type_counts,
+            observed_exec_attempt_invocations,
+            observed_interpreter_invocations,
             generated_acceptable_exec_paths,
             generated_acceptable_event_types,
         };
 
         Ok(TrainingOutput { policy, metadata })
     }
+}
+
+fn invocation_map_to_metadata(
+    invocations: &BTreeMap<InvocationKey, InvocationStats>,
+) -> Vec<ObservedInvocation> {
+    invocations
+        .iter()
+        .map(|(key, stats)| ObservedInvocation {
+            exe_path: key.exe_path.clone(),
+            argv: key.argv.clone(),
+            count: stats.count,
+            sessions_seen: stats.sessions_seen.len() as u64,
+            workload_id: key.workload_id.clone(),
+        })
+        .collect()
+}
+
+fn is_interpreter_invocation(invocation: &ObservedInvocation) -> bool {
+    let exe_path = invocation.exe_path.trim();
+    if is_interpreter_basename(path_basename(exe_path)) {
+        return true;
+    }
+
+    if exe_path_is_non_informative(exe_path)
+        && let Some(argv0) = invocation.argv.first()
+    {
+        return is_interpreter_basename(path_basename(argv0.trim()));
+    }
+
+    false
+}
+
+fn exe_path_is_non_informative(exe_path: &str) -> bool {
+    exe_path.is_empty() || !Path::new(exe_path).is_absolute()
+}
+
+fn path_basename(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+fn is_interpreter_basename(value: &str) -> bool {
+    matches!(
+        value,
+        "python" | "python3" | "sh" | "bash" | "node" | "ruby" | "perl" | "java"
+    )
 }
 
 fn increment_count(counts: &mut BTreeMap<String, u64>, value: String) {
@@ -388,8 +510,14 @@ where
 
     let file = File::create(path)
         .map_err(|e| anyhow!("failed to create {label} {}: {e}", path.display()))?;
-    serde_json::to_writer_pretty(BufWriter::new(file), value)
-        .map_err(|e| anyhow!("failed to write {label} {}: {e}", path.display()))
+    let mut writer = BufWriter::new(file);
+
+    serde_json::to_writer_pretty(&mut writer, value)
+        .map_err(|e| anyhow!("failed to write {label} {}: {e}", path.display()))?;
+
+    writer
+        .flush()
+        .map_err(|e| anyhow!("failed to flush {label} {}: {e}", path.display()))
 }
 
 fn implicit_metadata_path(policy_out: &Path) -> PathBuf {
@@ -494,6 +622,26 @@ mod tests {
         event_type: RuntimeEventType,
         comm: &str,
     ) -> EvidenceRecord {
+        runtime_record_with_argv(
+            session_id,
+            seq_no,
+            workload_id,
+            exe_path,
+            event_type,
+            comm,
+            &[],
+        )
+    }
+
+    fn runtime_record_with_argv(
+        session_id: &str,
+        seq_no: u64,
+        workload_id: Option<&str>,
+        exe_path: &str,
+        event_type: RuntimeEventType,
+        comm: &str,
+        argv: &[&str],
+    ) -> EvidenceRecord {
         EvidenceRecord::RuntimeEvent(EvidenceEvent {
             session_id: session_id.to_owned(),
             seq_no,
@@ -509,7 +657,7 @@ mod tests {
                 cpu: 2,
                 comm: comm.to_owned(),
                 exe_path: exe_path.to_owned(),
-                argv: Vec::new(),
+                argv: argv.iter().map(|value| value.to_string()).collect(),
             },
             classification: EventClassification::Acceptable,
             rule_id: String::from("test"),
@@ -653,10 +801,7 @@ mod tests {
 
         let output = train(&[&left, &right], None);
 
-        assert_eq!(
-            output.policy.acceptable.exec_paths,
-            vec!["/usr/bin/echo", "/usr/bin/python"]
-        );
+        assert_eq!(output.policy.acceptable.exec_paths, vec!["/usr/bin/echo"]);
         assert_eq!(output.policy.acceptable.event_types, vec!["exec", "fork"]);
         assert_eq!(output.metadata.sessions_used, vec![SESSION_A, SESSION_B]);
     }
@@ -860,7 +1005,237 @@ mod tests {
             output.metadata.generated_acceptable_event_types,
             vec!["exec"]
         );
+        assert_eq!(output.policy.acceptable.exec_paths, vec!["/usr/bin/echo"]);
         assert_eq!(output.policy.acceptable.event_types, vec!["exec"]);
+    }
+
+    #[test]
+    fn exec_attempt_invocations_are_metadata_only_and_count_duplicates() {
+        let files = TestFiles::new("exec-attempt-metadata");
+        files.write(
+            SESSION_A,
+            &[
+                runtime_record(
+                    SESSION_A,
+                    1,
+                    Some("workload-a"),
+                    "/usr/bin/echo",
+                    RuntimeEventType::Exec,
+                    "echo",
+                ),
+                runtime_record_with_argv(
+                    SESSION_A,
+                    2,
+                    Some("workload-a"),
+                    "/usr/local/bin/python",
+                    RuntimeEventType::ExecAttempt,
+                    "python",
+                    &["python", "-m", "uvicorn", "app:app"],
+                ),
+                runtime_record_with_argv(
+                    SESSION_A,
+                    3,
+                    Some("workload-a"),
+                    "/usr/local/bin/python",
+                    RuntimeEventType::ExecAttempt,
+                    "python",
+                    &["python", "-m", "uvicorn", "app:app"],
+                ),
+            ],
+            3,
+        );
+
+        let output = train(&[&files], None);
+
+        assert_eq!(
+            output.metadata.observed_exec_attempt_invocations,
+            vec![ObservedInvocation {
+                exe_path: String::from("/usr/local/bin/python"),
+                argv: vec![
+                    String::from("python"),
+                    String::from("-m"),
+                    String::from("uvicorn"),
+                    String::from("app:app")
+                ],
+                count: 2,
+                sessions_seen: 1,
+                workload_id: Some(String::from("workload-a")),
+            }]
+        );
+        assert_eq!(
+            output.metadata.observed_interpreter_invocations,
+            output.metadata.observed_exec_attempt_invocations
+        );
+        assert_eq!(output.policy.acceptable.exec_paths, vec!["/usr/bin/echo"]);
+        assert_eq!(output.policy.acceptable.event_types, vec!["exec"]);
+        assert!(
+            output
+                .policy
+                .acceptable
+                .argv_sensitive_exec_paths
+                .is_empty()
+        );
+        assert!(output.policy.acceptable.allowed_invocations.is_empty());
+        let policy_json = serde_json::to_string(&output.policy).expect("policy");
+        assert!(!policy_json.contains("argv"));
+        assert!(!policy_json.contains("argv_sensitive_exec_paths"));
+        assert!(!policy_json.contains("allowed_invocations"));
+    }
+
+    #[test]
+    fn exec_attempt_invocations_count_sessions_and_stay_deterministic() {
+        let left = TestFiles::new("exec-attempt-session-left");
+        left.write(
+            SESSION_A,
+            &[
+                runtime_record(
+                    SESSION_A,
+                    1,
+                    Some("workload-a"),
+                    "/usr/bin/echo",
+                    RuntimeEventType::Exec,
+                    "echo",
+                ),
+                runtime_record_with_argv(
+                    SESSION_A,
+                    2,
+                    Some("workload-a"),
+                    "/usr/local/bin/python",
+                    RuntimeEventType::ExecAttempt,
+                    "python",
+                    &["python", "-m", "app"],
+                ),
+            ],
+            2,
+        );
+        let right = TestFiles::new("exec-attempt-session-right");
+        right.write(
+            SESSION_B,
+            &[
+                runtime_record_with_argv(
+                    SESSION_B,
+                    1,
+                    Some("workload-a"),
+                    "/bin/bash",
+                    RuntimeEventType::ExecAttempt,
+                    "bash",
+                    &["bash", "-lc", "echo hi"],
+                ),
+                runtime_record_with_argv(
+                    SESSION_B,
+                    2,
+                    Some("workload-a"),
+                    "/usr/local/bin/python",
+                    RuntimeEventType::ExecAttempt,
+                    "python",
+                    &["python", "-m", "app"],
+                ),
+            ],
+            2,
+        );
+
+        let output = train(&[&right, &left], None);
+
+        assert_eq!(
+            output.metadata.observed_exec_attempt_invocations,
+            vec![
+                ObservedInvocation {
+                    exe_path: String::from("/bin/bash"),
+                    argv: vec![
+                        String::from("bash"),
+                        String::from("-lc"),
+                        String::from("echo hi")
+                    ],
+                    count: 1,
+                    sessions_seen: 1,
+                    workload_id: Some(String::from("workload-a")),
+                },
+                ObservedInvocation {
+                    exe_path: String::from("/usr/local/bin/python"),
+                    argv: vec![
+                        String::from("python"),
+                        String::from("-m"),
+                        String::from("app")
+                    ],
+                    count: 2,
+                    sessions_seen: 2,
+                    workload_id: Some(String::from("workload-a")),
+                },
+            ]
+        );
+        assert_eq!(
+            output.metadata.observed_interpreter_invocations,
+            output.metadata.observed_exec_attempt_invocations
+        );
+    }
+
+    #[test]
+    fn interpreter_detection_uses_argv0_for_non_informative_exe_path() {
+        let files = TestFiles::new("exec-attempt-argv0-interpreter");
+        files.write(
+            SESSION_A,
+            &[
+                runtime_record(
+                    SESSION_A,
+                    1,
+                    Some("workload-a"),
+                    "/usr/bin/echo",
+                    RuntimeEventType::Exec,
+                    "echo",
+                ),
+                runtime_record_with_argv(
+                    SESSION_A,
+                    2,
+                    Some("workload-a"),
+                    "",
+                    RuntimeEventType::ExecAttempt,
+                    "python",
+                    &["/usr/bin/python3", "script.py"],
+                ),
+                runtime_record_with_argv(
+                    SESSION_A,
+                    3,
+                    Some("workload-a"),
+                    "relative-launcher",
+                    RuntimeEventType::ExecAttempt,
+                    "node",
+                    &["node", "server.js"],
+                ),
+                runtime_record_with_argv(
+                    SESSION_A,
+                    4,
+                    Some("workload-a"),
+                    "/usr/bin/custom-tool",
+                    RuntimeEventType::ExecAttempt,
+                    "custom-tool",
+                    &["python", "ignored.py"],
+                ),
+            ],
+            4,
+        );
+
+        let output = train(&[&files], None);
+
+        assert_eq!(output.metadata.observed_exec_attempt_invocations.len(), 3);
+        assert_eq!(
+            output.metadata.observed_interpreter_invocations,
+            vec![
+                ObservedInvocation {
+                    exe_path: String::new(),
+                    argv: vec![String::from("/usr/bin/python3"), String::from("script.py")],
+                    count: 1,
+                    sessions_seen: 1,
+                    workload_id: Some(String::from("workload-a")),
+                },
+                ObservedInvocation {
+                    exe_path: String::from("relative-launcher"),
+                    argv: vec![String::from("node"), String::from("server.js")],
+                    count: 1,
+                    sessions_seen: 1,
+                    workload_id: Some(String::from("workload-a")),
+                },
+            ]
+        );
     }
 
     #[test]
@@ -988,7 +1363,11 @@ mod tests {
         })
         .expect_err("no executable paths");
 
-        assert!(error.to_string().contains("no non-empty executable paths"));
+        assert!(
+            error
+                .to_string()
+                .contains("no non-empty successful exec paths")
+        );
     }
 
     #[test]

@@ -86,10 +86,10 @@ pub mod evidence;
 
 #[cfg(feature = "user")]
 pub use evidence::{
-    AcceptablePolicy, AttestationPolicy, ClassificationResult, DeniedPolicy, EventClassification,
-    EvidenceEvent, EvidenceRecord, EvidenceSyntheticRecord, RuntimeEvent, RuntimePolicy,
-    RuntimeSummary, SuspiciousPolicy, SyntheticRecordType, TpmQuoteSummary, TpmSummary,
-    classified_tpm_digest, classify_event, event_hash, final_summary_digest, generate_session_id,
-    hex_decode_32, hex_encode, policy_hash, replay_pcr_extend, session_start_digest,
-    synthetic_record_hash, update_software_chain,
+    AcceptableInvocationPolicy, AcceptablePolicy, AttestationPolicy, ClassificationResult,
+    DeniedPolicy, EventClassification, EvidenceEvent, EvidenceRecord, EvidenceSyntheticRecord,
+    InvocationMatchType, RuntimeEvent, RuntimePolicy, RuntimeSummary, SuspiciousPolicy,
+    SyntheticRecordType, TpmQuoteSummary, TpmSummary, classified_tpm_digest, classify_event,
+    event_hash, final_summary_digest, generate_session_id, hex_decode_32, hex_encode, policy_hash,
+    replay_pcr_extend, session_start_digest, synthetic_record_hash, update_software_chain,
 };

@@ -288,6 +288,36 @@ fn argv_from_raw_event(raw: &Event) -> Vec<String> {
     argv
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "kebab-case")]
+pub enum InvocationMatchType {
+    Exact,
+}
+
+impl Default for InvocationMatchType {
+    fn default() -> Self {
+        Self::Exact
+    }
+}
+
+impl InvocationMatchType {
+    fn canonical_encode(self, buf: &mut Vec<u8>) {
+        match self {
+            Self::Exact => encode_u8(buf, 1),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptableInvocationPolicy {
+    pub exe_path: String,
+    pub argv: Vec<String>,
+
+    #[serde(default)]
+    pub match_type: InvocationMatchType,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct AcceptablePolicy {
@@ -296,6 +326,12 @@ pub struct AcceptablePolicy {
 
     #[serde(default)]
     pub event_types: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv_sensitive_exec_paths: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allowed_invocations: Vec<AcceptableInvocationPolicy>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -766,6 +802,10 @@ pub fn classify_event(event: &RuntimeEvent, policy: &RuntimePolicy) -> Classific
         };
     }
 
+    if let Some(result) = classify_argv_sensitive_invocation(event, policy) {
+        return result;
+    }
+
     // For exec events, an executable path must be explicitly acceptable when
     // `unknown_exec_path` is enabled. Listing "exec" in acceptable.event_types
     // must not accidentally approve all executable paths.
@@ -870,6 +910,64 @@ fn acceptable_by_event_type(event: &RuntimeEvent, policy: &RuntimePolicy) -> Opt
         .then(|| format!("event type {event_type} is acceptable"))
 }
 
+fn classify_argv_sensitive_invocation(
+    event: &RuntimeEvent,
+    policy: &RuntimePolicy,
+) -> Option<ClassificationResult> {
+    // Stage 9D does not correlate exec-attempt records with later successful
+    // sched_process_exec records. Successful exec records usually have empty
+    // argv and only match if an empty-argv invocation is explicitly allowed.
+    if !is_argv_sensitive_exec_path(&event.exe_path, policy) {
+        return None;
+    }
+
+    if let Some(reason) = acceptable_by_allowed_invocation(event, policy) {
+        return Some(ClassificationResult {
+            classification: EventClassification::Acceptable,
+            rule_id: String::from("acceptable-argv-invocation"),
+            reason,
+        });
+    }
+
+    Some(ClassificationResult {
+        classification: EventClassification::Suspicious,
+        rule_id: String::from("argv-sensitive-mismatch"),
+        reason: format!(
+            "argv-sensitive exec path {} did not match allowed invocation policy",
+            event.exe_path
+        ),
+    })
+}
+
+fn is_argv_sensitive_exec_path(exe_path: &str, policy: &RuntimePolicy) -> bool {
+    policy
+        .acceptable
+        .argv_sensitive_exec_paths
+        .iter()
+        .any(|path| path == exe_path)
+}
+
+fn acceptable_by_allowed_invocation(
+    event: &RuntimeEvent,
+    policy: &RuntimePolicy,
+) -> Option<String> {
+    policy
+        .acceptable
+        .allowed_invocations
+        .iter()
+        .any(|invocation| {
+            invocation.exe_path == event.exe_path
+                && invocation.match_type == InvocationMatchType::Exact
+                && invocation.argv == event.argv
+        })
+        .then(|| {
+            format!(
+                "argv-sensitive invocation for exec path {} is acceptable",
+                event.exe_path
+            )
+        })
+}
+
 fn policy_canonical_bytes(policy: &RuntimePolicy) -> Vec<u8> {
     let mut buf = Vec::new();
 
@@ -881,6 +979,20 @@ fn policy_canonical_bytes(policy: &RuntimePolicy) -> Vec<u8> {
 
     let acceptable_event_types = sorted_strings(&policy.acceptable.event_types);
     encode_str_list(&mut buf, &acceptable_event_types);
+
+    let argv_sensitive_exec_paths = sorted_strings(&policy.acceptable.argv_sensitive_exec_paths);
+    encode_str_list(&mut buf, &argv_sensitive_exec_paths);
+
+    let mut allowed_invocations = policy.acceptable.allowed_invocations.clone();
+    allowed_invocations.sort_unstable();
+    let allowed_invocation_count = u32::try_from(allowed_invocations.len())
+        .expect("canonical invocation list too large to encode");
+    encode_u32(&mut buf, allowed_invocation_count);
+    for invocation in &allowed_invocations {
+        encode_str(&mut buf, &invocation.exe_path);
+        invocation.match_type.canonical_encode(&mut buf);
+        encode_str_list(&mut buf, &invocation.argv);
+    }
 
     encode_bool(&mut buf, policy.suspicious.unknown_exec_path);
 
@@ -926,6 +1038,7 @@ mod tests {
     use crate::{ARG_LEN, MAX_ARGS};
     use bytemuck::Zeroable;
     use core::mem;
+    use std::vec;
 
     fn sample_event() -> RuntimeEvent {
         RuntimeEvent {
@@ -956,6 +1069,7 @@ mod tests {
                     String::from("/usr/local/bin/uvicorn"),
                 ]),
                 event_types: Vec::from([String::from("exec"), String::from("fork")]),
+                ..AcceptablePolicy::default()
             },
             suspicious: SuspiciousPolicy {
                 unknown_exec_path: true,
@@ -1441,6 +1555,154 @@ mod tests {
     }
 
     #[test]
+    fn old_policy_json_without_argv_sensitive_fields_deserializes() {
+        let json = r#"{
+            "workload_id": "fastapi",
+            "profile_mode": "minimal-behaviour",
+            "acceptable": {
+                "exec_paths": ["/usr/bin/echo"],
+                "event_types": ["exec"]
+            },
+            "suspicious": {
+                "unknown_exec_path": true
+            },
+            "denied": {
+                "exec_paths": ["/usr/bin/id"],
+                "comm_names": []
+            },
+            "attestation": {
+                "backend": "none",
+                "mode": "software-chain"
+            }
+        }"#;
+
+        let policy = serde_json::from_str::<RuntimePolicy>(json).expect("policy");
+
+        assert!(policy.acceptable.argv_sensitive_exec_paths.is_empty());
+        assert!(policy.acceptable.allowed_invocations.is_empty());
+    }
+
+    #[test]
+    fn argv_sensitive_exact_invocation_is_acceptable() {
+        let mut policy = sample_policy();
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("uvicorn"),
+                String::from("app:app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let mut event = sample_event();
+        event.event_type = RuntimeEventType::ExecAttempt;
+        event.argv = vec![
+            String::from("python"),
+            String::from("-m"),
+            String::from("uvicorn"),
+            String::from("app:app"),
+        ];
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Acceptable);
+        assert_eq!(result.rule_id, "acceptable-argv-invocation");
+    }
+
+    #[test]
+    fn allowed_invocation_without_sensitive_path_does_not_accept_event() {
+        let mut policy = sample_policy();
+        policy.acceptable.exec_paths.clear();
+        policy.acceptable.event_types.clear();
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let mut event = sample_event();
+        event.event_type = RuntimeEventType::ExecAttempt;
+        event.argv = vec![
+            String::from("python"),
+            String::from("-m"),
+            String::from("app"),
+        ];
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Suspicious);
+        assert_eq!(result.rule_id, "default-suspicious");
+    }
+
+    #[test]
+    fn argv_sensitive_mismatch_is_suspicious_and_overrides_exec_path_allow() {
+        let mut policy = sample_policy();
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("uvicorn"),
+                String::from("app:app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let mut event = sample_event();
+        event.event_type = RuntimeEventType::ExecAttempt;
+        event.argv = vec![
+            String::from("python"),
+            String::from("-c"),
+            String::from("print(1)"),
+        ];
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Suspicious);
+        assert_eq!(result.rule_id, "argv-sensitive-mismatch");
+    }
+
+    #[test]
+    fn argv_sensitive_successful_exec_with_empty_argv_requires_explicit_empty_invocation() {
+        let mut policy = sample_policy();
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let event = sample_event();
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Suspicious);
+        assert_eq!(result.rule_id, "argv-sensitive-mismatch");
+
+        policy
+            .acceptable
+            .allowed_invocations
+            .push(AcceptableInvocationPolicy {
+                exe_path: String::from("/usr/local/bin/python"),
+                argv: Vec::new(),
+                match_type: InvocationMatchType::Exact,
+            });
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Acceptable);
+        assert_eq!(result.rule_id, "acceptable-argv-invocation");
+    }
+
+    #[test]
     fn policy_hash_is_deterministic() {
         let policy = sample_policy();
 
@@ -1465,6 +1727,42 @@ mod tests {
         ]);
 
         assert_eq!(policy_hash(&left), policy_hash(&right));
+    }
+
+    #[test]
+    fn policy_hash_depends_on_argv_sensitive_exec_paths() {
+        let left = sample_policy();
+        let mut right = sample_policy();
+        right.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+
+        assert_ne!(policy_hash(&left), policy_hash(&right));
+    }
+
+    #[test]
+    fn policy_hash_depends_on_allowed_invocation_exe_path_and_argv() {
+        let mut baseline = sample_policy();
+        baseline.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        baseline.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let mut changed_argv = baseline.clone();
+        changed_argv.acceptable.allowed_invocations[0].argv = vec![
+            String::from("python"),
+            String::from("-c"),
+            String::from("print(1)"),
+        ];
+        let mut changed_exe_path = baseline.clone();
+        changed_exe_path.acceptable.allowed_invocations[0].exe_path =
+            String::from("/usr/bin/python3");
+
+        assert_ne!(policy_hash(&baseline), policy_hash(&changed_argv));
+        assert_ne!(policy_hash(&baseline), policy_hash(&changed_exe_path));
     }
 
     #[test]

@@ -1631,6 +1631,7 @@ mod tests {
             acceptable: AcceptablePolicy {
                 exec_paths: vec![String::from("/usr/bin/echo")],
                 event_types: vec![String::from("exec")],
+                ..AcceptablePolicy::default()
             },
             suspicious: SuspiciousPolicy {
                 unknown_exec_path: true,

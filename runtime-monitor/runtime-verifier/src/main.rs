@@ -1760,8 +1760,8 @@ mod tests {
     use super::*;
     use runtime_monitor_common::evidence::RuntimeEventType;
     use runtime_monitor_common::{
-        AcceptablePolicy, AttestationPolicy, DeniedPolicy, SuspiciousPolicy, TpmQuoteSummary,
-        TpmSummary,
+        AcceptableInvocationPolicy, AcceptablePolicy, AttestationPolicy, DeniedPolicy,
+        InvocationMatchType, SuspiciousPolicy, TpmQuoteSummary, TpmSummary,
     };
     use std::cell::RefCell;
 
@@ -1857,6 +1857,7 @@ mod tests {
             acceptable: AcceptablePolicy {
                 exec_paths: vec![String::from("/usr/bin/echo")],
                 event_types: vec![String::from("exec"), String::from("fork")],
+                ..AcceptablePolicy::default()
             },
             suspicious: SuspiciousPolicy {
                 unknown_exec_path: true,
@@ -2689,6 +2690,139 @@ mod tests {
         assert_eq!(report.counts.acceptable, 1);
         assert!(report.checks.event_hashes_valid);
         assert!(report.checks.classification_valid);
+    }
+
+    #[test]
+    fn argv_sensitive_exact_invocation_verifies_as_accept() {
+        let mut policy = base_policy();
+        policy.acceptable.exec_paths.clear();
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("uvicorn"),
+                String::from("app:app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let (events, summary) = evidence_fixture(
+            &policy,
+            vec![exec_attempt_event(
+                "/usr/local/bin/python",
+                vec!["python", "-m", "uvicorn", "app:app"],
+            )],
+        );
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert_eq!(report.counts.acceptable, 1);
+        assert!(report.checks.classification_valid);
+    }
+
+    #[test]
+    fn argv_sensitive_mismatch_verifies_as_accept_with_warnings() {
+        let mut policy = base_policy();
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("uvicorn"),
+                String::from("app:app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let (events, summary) = evidence_fixture(
+            &policy,
+            vec![exec_attempt_event(
+                "/usr/local/bin/python",
+                vec!["python", "-c", "print(1)"],
+            )],
+        );
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::AcceptWithWarnings);
+        assert_eq!(report.counts.suspicious, 1);
+        assert!(report.checks.classification_valid);
+    }
+
+    #[test]
+    fn argv_sensitive_exec_path_allow_still_requires_argv_match() {
+        let mut policy = base_policy();
+        policy
+            .acceptable
+            .exec_paths
+            .push(String::from("/usr/local/bin/python"));
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let (events, summary) = evidence_fixture(
+            &policy,
+            vec![exec_attempt_event(
+                "/usr/local/bin/python",
+                vec!["python", "-c", "print(1)"],
+            )],
+        );
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::AcceptWithWarnings);
+        assert_eq!(report.counts.suspicious, 1);
+    }
+
+    #[test]
+    fn denied_exec_path_rejects_even_when_argv_invocation_is_allowed() {
+        let mut policy = base_policy();
+        policy
+            .denied
+            .exec_paths
+            .push(String::from("/usr/local/bin/python"));
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let (events, summary) = evidence_fixture(
+            &policy,
+            vec![exec_attempt_event(
+                "/usr/local/bin/python",
+                vec!["python", "-m", "app"],
+            )],
+        );
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Reject);
+        assert_eq!(report.counts.denied, 1);
+    }
+
+    #[test]
+    fn old_policy_without_argv_sensitive_fields_still_accepts_echo() {
+        let policy = base_policy();
+        let (events, summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert!(policy.acceptable.argv_sensitive_exec_paths.is_empty());
+        assert!(policy.acceptable.allowed_invocations.is_empty());
     }
 
     #[test]
