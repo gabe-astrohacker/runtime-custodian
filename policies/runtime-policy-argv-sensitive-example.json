@@ -1,0 +1,40 @@
+{
+  "workload_id": "fastapi-echo",
+  "profile_mode": "minimal-behaviour",
+  "acceptable": {
+    "exec_paths": [
+      "/usr/bin/echo"
+    ],
+    "event_types": [
+      "fork"
+    ],
+    "argv_sensitive_exec_paths": [
+      "/usr/local/bin/python"
+    ],
+    "allowed_invocations": [
+      {
+        "exe_path": "/usr/local/bin/python",
+        "argv": [
+          "python",
+          "-c",
+          "print('stage9e allowed example')"
+        ],
+        "match_type": "exact"
+      }
+    ]
+  },
+  "suspicious": {
+    "unknown_exec_path": true
+  },
+  "denied": {
+    "exec_paths": [],
+    "comm_names": []
+  },
+  "attestation": {
+    "backend": "none",
+    "mode": "software-chain",
+    "fail_on_suspicious": false,
+    "fail_on_denied": true,
+    "fail_on_drops": true
+  }
+}
