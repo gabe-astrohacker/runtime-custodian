@@ -261,8 +261,12 @@ impl PolicyLearner {
 
         let generated_acceptable_exec_paths: Vec<String> =
             self.observed_executable_counts.keys().cloned().collect();
-        let generated_acceptable_event_types: Vec<String> =
-            self.observed_event_type_counts.keys().cloned().collect();
+        let generated_acceptable_event_types: Vec<String> = self
+            .observed_event_type_counts
+            .keys()
+            .filter(|event_type| event_type.as_str() != "exec-attempt")
+            .cloned()
+            .collect();
 
         let policy = RuntimePolicy {
             workload_id,
@@ -505,6 +509,7 @@ mod tests {
                 cpu: 2,
                 comm: comm.to_owned(),
                 exe_path: exe_path.to_owned(),
+                argv: Vec::new(),
             },
             classification: EventClassification::Acceptable,
             rule_id: String::from("test"),
@@ -816,6 +821,46 @@ mod tests {
             vec!["/usr/bin/echo", "/usr/bin/python"]
         );
         assert_eq!(output.policy.acceptable.event_types, vec!["exec", "fork"]);
+    }
+
+    #[test]
+    fn exec_attempt_is_counted_but_not_generated_as_acceptable_event_type() {
+        let files = TestFiles::new("exec-attempt-event-type");
+        files.write(
+            SESSION_A,
+            &[
+                runtime_record(
+                    SESSION_A,
+                    1,
+                    Some("workload-a"),
+                    "/usr/bin/echo",
+                    RuntimeEventType::Exec,
+                    "echo",
+                ),
+                runtime_record(
+                    SESSION_A,
+                    2,
+                    Some("workload-a"),
+                    "/usr/bin/python",
+                    RuntimeEventType::ExecAttempt,
+                    "python",
+                ),
+            ],
+            2,
+        );
+
+        let output = train(&[&files], None);
+
+        assert_eq!(output.metadata.observed_event_type_counts["exec"], 1);
+        assert_eq!(
+            output.metadata.observed_event_type_counts["exec-attempt"],
+            1
+        );
+        assert_eq!(
+            output.metadata.generated_acceptable_event_types,
+            vec!["exec"]
+        );
+        assert_eq!(output.policy.acceptable.event_types, vec!["exec"]);
     }
 
     #[test]

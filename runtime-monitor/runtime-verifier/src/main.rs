@@ -1905,7 +1905,15 @@ mod tests {
             cpu: 2,
             comm: String::from("echo"),
             exe_path: exe_path.to_owned(),
+            argv: Vec::new(),
         }
+    }
+
+    fn exec_attempt_event(exe_path: &str, argv: Vec<&str>) -> RuntimeEvent {
+        let mut event = runtime_event(exe_path);
+        event.event_type = RuntimeEventType::ExecAttempt;
+        event.argv = argv.into_iter().map(String::from).collect();
+        event
     }
 
     fn evidence_fixture(
@@ -2637,6 +2645,50 @@ mod tests {
                 .map(|event| event.seq_no),
             Some(4)
         );
+    }
+
+    #[test]
+    fn exec_attempt_is_replayed_as_suspicious_when_only_exec_event_type_is_acceptable() {
+        let policy = base_policy();
+        let (events, summary) = evidence_fixture(
+            &policy,
+            vec![exec_attempt_event(
+                "/tmp/not-profiled",
+                vec!["/tmp/not-profiled", "--version"],
+            )],
+        );
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::AcceptWithWarnings);
+        assert_eq!(report.counts.suspicious, 1);
+        assert!(report.checks.event_hashes_valid);
+        assert!(report.checks.classification_valid);
+        assert_eq!(
+            report
+                .first_suspicious_event
+                .as_ref()
+                .map(|event| event.seq_no),
+            Some(4)
+        );
+    }
+
+    #[test]
+    fn exec_attempt_is_acceptable_when_explicitly_listed() {
+        let mut policy = base_policy();
+        policy.acceptable.exec_paths.clear();
+        policy.acceptable.event_types = vec![String::from("exec-attempt")];
+        let (events, summary) = evidence_fixture(
+            &policy,
+            vec![exec_attempt_event("python", vec!["python", "-m", "app"])],
+        );
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert_eq!(report.counts.acceptable, 1);
+        assert!(report.checks.event_hashes_valid);
+        assert!(report.checks.classification_valid);
     }
 
     #[test]

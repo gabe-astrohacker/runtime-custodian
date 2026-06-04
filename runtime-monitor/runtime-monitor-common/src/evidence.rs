@@ -1,4 +1,4 @@
-use crate::{Event, EventType, UNKNOWN_WORKLOAD_INDEX};
+use crate::{Event, EventType, MAX_ARGS, UNKNOWN_WORKLOAD_INDEX};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -124,6 +124,7 @@ fn finalize_sha256(hasher: Sha256) -> [u8; 32] {
 pub enum RuntimeEventType {
     Fork,
     Exec,
+    ExecAttempt,
     Unknown(u32),
 }
 
@@ -133,6 +134,8 @@ impl RuntimeEventType {
             Self::Fork
         } else if raw == EventType::Exec as u32 {
             Self::Exec
+        } else if raw == EventType::ExecAttempt as u32 {
+            Self::ExecAttempt
         } else {
             Self::Unknown(raw)
         }
@@ -146,6 +149,7 @@ impl RuntimeEventType {
         match self {
             Self::Fork => String::from("fork"),
             Self::Exec => String::from("exec"),
+            Self::ExecAttempt => String::from("exec-attempt"),
             Self::Unknown(raw) => format!("unknown-{raw}"),
         }
     }
@@ -154,6 +158,7 @@ impl RuntimeEventType {
         match self {
             Self::Fork => encode_u8(buf, 1),
             Self::Exec => encode_u8(buf, 2),
+            Self::ExecAttempt => encode_u8(buf, 3),
             Self::Unknown(raw) => {
                 encode_u8(buf, 255);
                 encode_u32(buf, raw);
@@ -227,6 +232,9 @@ pub struct RuntimeEvent {
     pub cpu: u32,
     pub comm: String,
     pub exe_path: String,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub argv: Vec<String>,
 }
 
 impl RuntimeEvent {
@@ -243,6 +251,7 @@ impl RuntimeEvent {
             cpu: raw.cpu,
             comm: bytes_to_lossy_string(&raw.comm),
             exe_path: bytes_to_lossy_string_len(&raw.filename, raw.filename_len),
+            argv: argv_from_raw_event(raw),
         }
     }
 
@@ -264,9 +273,19 @@ impl RuntimeEvent {
         encode_opt_str(&mut buf, &self.workload_id);
         encode_str(&mut buf, &self.comm);
         encode_str(&mut buf, &self.exe_path);
+        encode_str_list(&mut buf, &self.argv);
 
         buf
     }
+}
+
+fn argv_from_raw_event(raw: &Event) -> Vec<String> {
+    let argc = usize::min(raw.argc as usize, MAX_ARGS);
+    let mut argv = Vec::new();
+    for arg in raw.argv.iter().take(argc) {
+        argv.push(bytes_to_lossy_string(arg));
+    }
+    argv
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -904,6 +923,9 @@ fn policy_canonical_bytes(policy: &RuntimePolicy) -> Vec<u8> {
 #[cfg(all(test, feature = "user"))]
 mod tests {
     use super::*;
+    use crate::{ARG_LEN, MAX_ARGS};
+    use bytemuck::Zeroable;
+    use core::mem;
 
     fn sample_event() -> RuntimeEvent {
         RuntimeEvent {
@@ -918,8 +940,11 @@ mod tests {
             cpu: 2,
             comm: String::from("python"),
             exe_path: String::from("/usr/local/bin/python"),
+            argv: Vec::new(),
         }
     }
+
+    fn assert_pod<T: bytemuck::Pod>() {}
 
     fn sample_policy() -> RuntimePolicy {
         RuntimePolicy {
@@ -973,6 +998,53 @@ mod tests {
         let right = event_hash(&session, 2, &event);
 
         assert_ne!(left, right);
+    }
+
+    #[test]
+    fn event_hash_depends_on_argv() {
+        let mut left_event = sample_event();
+        let mut right_event = sample_event();
+        right_event.argv = Vec::from([String::from("python"), String::from("app.py")]);
+        let session = [7u8; 32];
+
+        let left = event_hash(&session, 1, &left_event);
+        let right = event_hash(&session, 1, &right_event);
+
+        assert_ne!(left, right);
+        left_event.argv = right_event.argv.clone();
+        assert_eq!(
+            event_hash(&session, 1, &left_event),
+            event_hash(&session, 1, &right_event)
+        );
+    }
+
+    #[test]
+    fn raw_event_remains_pod_zeroable_and_aligned() {
+        assert_pod::<Event>();
+        let event = Event::zeroed();
+
+        assert_eq!(event.argc, 0);
+        assert_eq!(argv_from_raw_event(&event), Vec::<String>::new());
+        assert!(mem::align_of::<Event>() <= 8);
+    }
+
+    #[test]
+    fn argv_from_raw_event_clamps_and_decodes_lossy_strings() {
+        let mut event = Event::zeroed();
+        event.argc = (MAX_ARGS + 2) as u32;
+        event.argv[0][..6].copy_from_slice(b"python");
+        event.argv[1][..6].copy_from_slice(b"app.py");
+        event.argv[2].fill(b'a');
+        event.argv[2][ARG_LEN - 1] = b'z';
+        event.argv[3][..3].copy_from_slice(&[0xff, 0xfe, 0]);
+
+        let argv = argv_from_raw_event(&event);
+
+        assert_eq!(argv.len(), MAX_ARGS);
+        assert_eq!(argv[0], "python");
+        assert_eq!(argv[1], "app.py");
+        assert_eq!(argv[2].len(), ARG_LEN);
+        assert_eq!(argv[3], String::from_utf8_lossy(&[0xff, 0xfe]).into_owned());
     }
 
     #[test]
@@ -1086,6 +1158,61 @@ mod tests {
 
         let encoded = serde_json::to_string(&record).expect("serialize");
         assert!(encoded.contains("\"record_kind\":\"runtime-event\""));
+        let decoded = serde_json::from_str::<EvidenceRecord>(&encoded).expect("deserialize");
+
+        assert_eq!(decoded, record);
+    }
+
+    #[test]
+    fn old_runtime_event_json_without_argv_deserializes_with_empty_argv() {
+        let json = r#"{
+            "workload_index": 3,
+            "workload_id": "fastapi",
+            "event_type": "exec",
+            "timestamp_ns": 42,
+            "cgroup_id": 99,
+            "pid": 123,
+            "tgid": 456,
+            "ppid": 789,
+            "cpu": 2,
+            "comm": "python",
+            "exe_path": "/usr/local/bin/python"
+        }"#;
+
+        let event = serde_json::from_str::<RuntimeEvent>(json).expect("runtime event");
+
+        assert!(event.argv.is_empty());
+    }
+
+    #[test]
+    fn exec_attempt_runtime_event_ser_de_round_trip() {
+        let mut runtime_event = sample_event();
+        runtime_event.event_type = RuntimeEventType::ExecAttempt;
+        runtime_event.exe_path = String::from("python");
+        runtime_event.argv = Vec::from([
+            String::from("python"),
+            String::from("-m"),
+            String::from("app"),
+        ]);
+        let session_id = hex_encode(&[7u8; 32]);
+        let event_hash_bytes = event_hash(&[7u8; 32], 1, &runtime_event);
+        let chain_head = update_software_chain(ZERO_CHAIN_HEAD, event_hash_bytes);
+        let record = EvidenceRecord::RuntimeEvent(EvidenceEvent {
+            session_id,
+            seq_no: 1,
+            event: runtime_event,
+            classification: EventClassification::Suspicious,
+            rule_id: String::from("default-suspicious"),
+            reason: String::from("test"),
+            event_hash: hex_encode(&event_hash_bytes),
+            software_chain_head: hex_encode(&chain_head),
+            tpm_extended: false,
+            tpm_extend_index: None,
+        });
+
+        let encoded = serde_json::to_string(&record).expect("serialize");
+        assert!(encoded.contains("\"event_type\":\"exec-attempt\""));
+        assert!(encoded.contains("\"argv\":[\"python\",\"-m\",\"app\"]"));
         let decoded = serde_json::from_str::<EvidenceRecord>(&encoded).expect("deserialize");
 
         assert_eq!(decoded, record);
@@ -1271,6 +1398,40 @@ mod tests {
         policy.suspicious.unknown_exec_path = false;
 
         let mut event = sample_event();
+        event.exe_path = String::from("/tmp/not-profiled");
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Acceptable);
+        assert_eq!(result.rule_id, "acceptable-event-type");
+    }
+
+    #[test]
+    fn exec_attempt_is_not_approved_by_exec_event_type() {
+        let mut policy = sample_policy();
+        policy.acceptable.exec_paths.clear();
+        policy.acceptable.event_types = Vec::from([String::from("exec")]);
+        policy.suspicious.unknown_exec_path = true;
+
+        let mut event = sample_event();
+        event.event_type = RuntimeEventType::ExecAttempt;
+        event.exe_path = String::from("/tmp/not-profiled");
+        event.argv = Vec::from([String::from("/tmp/not-profiled")]);
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Suspicious);
+        assert_eq!(result.rule_id, "default-suspicious");
+    }
+
+    #[test]
+    fn exec_attempt_can_be_acceptable_when_explicitly_listed() {
+        let mut policy = sample_policy();
+        policy.acceptable.exec_paths.clear();
+        policy.acceptable.event_types = Vec::from([String::from("exec-attempt")]);
+
+        let mut event = sample_event();
+        event.event_type = RuntimeEventType::ExecAttempt;
         event.exe_path = String::from("/tmp/not-profiled");
 
         let result = classify_event(&event, &policy);

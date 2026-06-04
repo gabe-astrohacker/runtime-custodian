@@ -114,6 +114,8 @@ struct SingleCollectorConfig {
     tpm_ak_context: Option<String>,
     tpm_ak_public: Option<String>,
     tpm_quote_out_dir: Option<String>,
+    #[serde(default)]
+    capture_argv: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -133,6 +135,8 @@ struct MultiCollectorConfig {
     tpm_ak_context: Option<String>,
     tpm_ak_public: Option<String>,
     tpm_quote_out_dir: Option<String>,
+    #[serde(default)]
+    capture_argv: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -236,6 +240,13 @@ impl CollectorConfig {
                 ak_public_path: config.tpm_ak_public.as_ref().map(PathBuf::from),
                 quote_out_dir: config.tpm_quote_out_dir.as_ref().map(PathBuf::from),
             },
+        }
+    }
+
+    fn capture_argv(&self) -> bool {
+        match self {
+            Self::Single(config) => config.capture_argv,
+            Self::Multi(config) => config.capture_argv,
         }
     }
 }
@@ -882,6 +893,12 @@ const TRACEPOINT_PROGRAMS: &[TracepointProgram] = &[TracepointProgram {
     tracepoint_name: "sched_process_exec",
 }];
 
+const ARGV_TRACEPOINT_PROGRAMS: &[TracepointProgram] = &[TracepointProgram {
+    program_name: "sys_enter_execve",
+    category: "syscalls",
+    tracepoint_name: "sys_enter_execve",
+}];
+
 fn load_collector_config(path: impl AsRef<Path>) -> Result<CollectorConfig> {
     let path = path.as_ref();
     let file = File::open(path).map_err(|e| anyhow!("failed to open {}: {e}", path.display()))?;
@@ -1409,6 +1426,10 @@ async fn main() -> Result<()> {
     }
 
     attach_tracepoint_programs(&mut ebpf, TRACEPOINT_PROGRAMS)?;
+    if collector_config.capture_argv() {
+        info!("bounded argv capture enabled; attaching exec-attempt tracepoint");
+        attach_tracepoint_programs(&mut ebpf, ARGV_TRACEPOINT_PROGRAMS)?;
+    }
 
     let mut ring = RingBuf::try_from(
         ebpf.take_map("EVENTS")
@@ -1454,8 +1475,8 @@ async fn main() -> Result<()> {
 mod tests {
     use super::*;
     use runtime_monitor_common::{
-        AcceptablePolicy, AttestationPolicy, DeniedPolicy, EventClassification, EventType,
-        EvidenceRecord, PATH_LEN, SuspiciousPolicy, SyntheticRecordType, TASK_COMM_LEN,
+        ARG_LEN, AcceptablePolicy, AttestationPolicy, DeniedPolicy, EventClassification, EventType,
+        EvidenceRecord, MAX_ARGS, PATH_LEN, SuspiciousPolicy, SyntheticRecordType, TASK_COMM_LEN,
     };
     use std::cell::RefCell;
     use std::os::unix::process::ExitStatusExt;
@@ -1754,7 +1775,8 @@ mod tests {
                 "tpm_quote_nonce": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
                 "tpm_ak_context": "attestation/ak.ctx",
                 "tpm_ak_public": "attestation/akpub.pem",
-                "tpm_quote_out_dir": "attestation/quotes"
+                "tpm_quote_out_dir": "attestation/quotes",
+                "capture_argv": true
             }"#,
         )
         .expect("collector config");
@@ -1785,6 +1807,7 @@ mod tests {
             quote_options.quote_out_dir.as_deref(),
             Some(Path::new("attestation/quotes"))
         );
+        assert!(config.capture_argv());
     }
 
     fn temp_output_paths(test_name: &str) -> (PathBuf, PathBuf) {
@@ -1844,6 +1867,9 @@ mod tests {
             reserved2: 0,
             comm: [0; TASK_COMM_LEN],
             filename: [0; PATH_LEN],
+            argc: 0,
+            argv_reserved: 0,
+            argv: [[0; ARG_LEN]; MAX_ARGS],
         };
 
         let comm = b"echo";
@@ -1854,6 +1880,19 @@ mod tests {
         event.filename[..filename.len()].copy_from_slice(filename);
         event.filename_len = filename.len() as u32;
 
+        event
+    }
+
+    fn sample_exec_attempt_event(exe_path: &str, argv: &[&str]) -> Event {
+        let mut event = sample_raw_event(exe_path);
+        event.event_type = EventType::ExecAttempt as u32;
+        event.argc = u32::try_from(argv.len()).expect("argc");
+        for (idx, arg) in argv.iter().enumerate() {
+            assert!(idx < MAX_ARGS);
+            let bytes = arg.as_bytes();
+            assert!(bytes.len() <= ARG_LEN);
+            event.argv[idx][..bytes.len()].copy_from_slice(bytes);
+        }
         event
     }
 
@@ -1974,6 +2013,9 @@ mod tests {
             SyntheticRecordType::WorkloadTargetBound
         );
         assert_eq!(runtime_event.event.exe_path, "/usr/bin/echo");
+        assert!(runtime_event.event.argv.is_empty());
+        let evidence_jsonl = fs::read_to_string(&evidence_out).expect("evidence");
+        assert!(!evidence_jsonl.contains("\"argv\""));
         assert_eq!(stop.record_type, SyntheticRecordType::MonitorStop);
 
         let summary = serde_json::from_str::<RuntimeSummary>(
@@ -1984,6 +2026,55 @@ mod tests {
         assert_eq!(summary.event_count, 1);
         assert_eq!(summary.synthetic_record_count, 4);
         assert_eq!(summary.software_chain_head, stop.software_chain_head);
+
+        let _ = fs::remove_file(evidence_out);
+        let _ = fs::remove_file(summary_out);
+    }
+
+    #[test]
+    fn exec_attempt_sample_serializes_bounded_argv() {
+        let (evidence_out, summary_out) = temp_output_paths("exec-attempt-argv");
+        let workloads = test_workloads();
+        let mut evidence = EvidenceCapture::new(
+            evidence_out.clone(),
+            summary_out.clone(),
+            &workloads,
+            CollectionMode::Scoped,
+            RuntimePolicy::default(),
+            PolicySource::Configured,
+            disabled_tpm_config(),
+        )
+        .expect("evidence capture");
+
+        evidence
+            .write_workload_target_bound(&workloads)
+            .expect("target bound");
+        let event = sample_exec_attempt_event("python", &["python", "-m", "app"]);
+        evidence
+            .process_sample(bytemuck::bytes_of(&event), &workloads, &NoopTpmRunner)
+            .expect("runtime sample");
+
+        let records = read_evidence_records(&evidence_out);
+        let EvidenceRecord::RuntimeEvent(runtime_event) = &records[3] else {
+            panic!("expected runtime event");
+        };
+
+        assert_eq!(
+            runtime_event.event.event_type,
+            runtime_monitor_common::evidence::RuntimeEventType::ExecAttempt
+        );
+        assert_eq!(runtime_event.event.exe_path, "python");
+        assert_eq!(
+            runtime_event.event.argv,
+            vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("app")
+            ]
+        );
+        let jsonl = fs::read_to_string(&evidence_out).expect("evidence");
+        assert!(jsonl.contains("\"event_type\":\"exec-attempt\""));
+        assert!(jsonl.contains("\"argv\":[\"python\",\"-m\",\"app\"]"));
 
         let _ = fs::remove_file(evidence_out);
         let _ = fs::remove_file(summary_out);

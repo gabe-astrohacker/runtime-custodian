@@ -7,6 +7,8 @@ use bytemuck::{Pod, Zeroable};
 
 pub const TASK_COMM_LEN: usize = 16;
 pub const PATH_LEN: usize = 512;
+pub const MAX_ARGS: usize = 8;
+pub const ARG_LEN: usize = 128;
 pub const FILENAME_TRUNCATED: u32 = 1;
 pub const COLLECTION_MODE_SCOPED: u32 = 0;
 pub const COLLECTION_MODE_HOST_WIDE: u32 = 1;
@@ -17,6 +19,7 @@ pub const UNKNOWN_WORKLOAD_INDEX: u32 = u32::MAX;
 pub enum EventType {
     Fork = 1,
     Exec = 2,
+    ExecAttempt = 3,
 }
 
 #[repr(C)]
@@ -63,6 +66,18 @@ pub struct Event {
 
     pub comm: [u8; TASK_COMM_LEN],
     pub filename: [u8; PATH_LEN],
+
+    /// Number of argv entries successfully copied into `argv`, not the true
+    /// process argc. The process may have supplied more arguments, or reads may
+    /// have stopped early on user-memory failures.
+    pub argc: u32,
+    pub argv_reserved: u32,
+    /// Bounded argv snapshot for exec-attempt evidence.
+    ///
+    /// Entries may be truncated to ARG_LEN. Exact argv-sensitive enforcement
+    /// should wait until the evidence format carries explicit truncation
+    /// metadata for individual argv entries.
+    pub argv: [[u8; ARG_LEN]; MAX_ARGS],
 }
 // Optional: userspace-only convenience impls can live behind cfg(feature = "user")
 
