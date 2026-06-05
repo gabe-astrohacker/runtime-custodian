@@ -1,8 +1,8 @@
 use anyhow::{Result, anyhow};
 use runtime_monitor_common::evidence::RuntimeEventType;
 use runtime_monitor_common::{
-    AcceptablePolicy, AttestationPolicy, DeniedPolicy, EvidenceRecord, RuntimeEvent, RuntimePolicy,
-    RuntimeSummary, SuspiciousPolicy,
+    AcceptableInvocationPolicy, AcceptablePolicy, AttestationPolicy, DeniedPolicy, EvidenceRecord,
+    InvocationMatchType, RuntimeEvent, RuntimePolicy, RuntimeSummary, SuspiciousPolicy,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -32,6 +32,7 @@ struct TrainingMetadata {
     workload_id_filter: Option<String>,
     total_runtime_event_count: u64,
     skipped_empty_exe_path_count: u64,
+    skipped_incomplete_argv_invocation_count: u64,
     observed_executable_counts: BTreeMap<String, u64>,
     observed_comm_counts: BTreeMap<String, u64>,
     observed_event_type_counts: BTreeMap<String, u64>,
@@ -175,6 +176,7 @@ struct PolicyLearner {
     workload_id_filter: Option<String>,
     total_runtime_event_count: u64,
     skipped_empty_exe_path_count: u64,
+    skipped_incomplete_argv_invocation_count: u64,
     observed_executable_counts: BTreeMap<String, u64>,
     observed_successful_exec_counts: BTreeMap<String, u64>,
     observed_comm_counts: BTreeMap<String, u64>,
@@ -202,6 +204,7 @@ impl PolicyLearner {
             workload_id_filter,
             total_runtime_event_count: 0,
             skipped_empty_exe_path_count: 0,
+            skipped_incomplete_argv_invocation_count: 0,
             observed_executable_counts: BTreeMap::new(),
             observed_successful_exec_counts: BTreeMap::new(),
             observed_comm_counts: BTreeMap::new(),
@@ -258,6 +261,11 @@ impl PolicyLearner {
     }
 
     fn observe_exec_attempt_invocation(&mut self, event: &RuntimeEvent, session_id: &str) {
+        if !argv_evidence_complete_for_invocation_training(event) {
+            self.skipped_incomplete_argv_invocation_count += 1;
+            return;
+        }
+
         let key = InvocationKey {
             workload_id: event
                 .workload_id
@@ -336,17 +344,22 @@ impl PolicyLearner {
             .collect();
         let observed_exec_attempt_invocations =
             invocation_map_to_metadata(&self.observed_exec_attempt_invocations);
-        let observed_interpreter_invocations = observed_exec_attempt_invocations
-            .iter()
-            .filter(|invocation| is_interpreter_invocation(invocation))
-            .cloned()
-            .collect();
+        let observed_interpreter_invocations: Vec<ObservedInvocation> =
+            observed_exec_attempt_invocations
+                .iter()
+                .filter(|invocation| is_interpreter_invocation(invocation))
+                .cloned()
+                .collect();
+        let (argv_sensitive_exec_paths, allowed_invocations) =
+            argv_sensitive_policy_from_invocations(&observed_interpreter_invocations);
 
         let policy = RuntimePolicy {
             workload_id,
             acceptable: AcceptablePolicy {
                 exec_paths: generated_acceptable_exec_paths.clone(),
                 event_types: generated_acceptable_event_types.clone(),
+                argv_sensitive_exec_paths,
+                allowed_invocations,
                 ..AcceptablePolicy::default()
             },
             suspicious: SuspiciousPolicy {
@@ -368,6 +381,7 @@ impl PolicyLearner {
             workload_id_filter: self.workload_id_filter,
             total_runtime_event_count: self.total_runtime_event_count,
             skipped_empty_exe_path_count: self.skipped_empty_exe_path_count,
+            skipped_incomplete_argv_invocation_count: self.skipped_incomplete_argv_invocation_count,
             observed_executable_counts: self.observed_executable_counts,
             observed_comm_counts: self.observed_comm_counts,
             observed_event_type_counts: self.observed_event_type_counts,
@@ -409,6 +423,41 @@ fn is_interpreter_invocation(invocation: &ObservedInvocation) -> bool {
     }
 
     false
+}
+
+fn argv_sensitive_policy_from_invocations(
+    invocations: &[ObservedInvocation],
+) -> (Vec<String>, Vec<AcceptableInvocationPolicy>) {
+    let mut argv_sensitive_exec_paths = BTreeSet::new();
+    let mut allowed_invocations = Vec::new();
+
+    for invocation in invocations {
+        let exe_path = invocation.exe_path.trim();
+        if exe_path_is_non_informative(exe_path) {
+            continue;
+        }
+
+        argv_sensitive_exec_paths.insert(exe_path.to_owned());
+        allowed_invocations.push(AcceptableInvocationPolicy {
+            exe_path: exe_path.to_owned(),
+            argv: invocation.argv.clone(),
+            match_type: InvocationMatchType::Exact,
+        });
+    }
+
+    allowed_invocations.sort_unstable();
+    (
+        argv_sensitive_exec_paths.into_iter().collect(),
+        allowed_invocations,
+    )
+}
+
+fn argv_evidence_complete_for_invocation_training(event: &RuntimeEvent) -> bool {
+    event.argv_complete
+        && !event.argv_truncated
+        && !event.argv_read_error
+        && !event.filename_truncated
+        && !event.filename_read_error
 }
 
 fn exe_path_is_non_informative(exe_path: &str) -> bool {
@@ -642,6 +691,37 @@ mod tests {
         comm: &str,
         argv: &[&str],
     ) -> EvidenceRecord {
+        runtime_record_with_argv_quality(
+            session_id,
+            seq_no,
+            workload_id,
+            exe_path,
+            event_type,
+            comm,
+            argv,
+            !argv.is_empty(),
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn runtime_record_with_argv_quality(
+        session_id: &str,
+        seq_no: u64,
+        workload_id: Option<&str>,
+        exe_path: &str,
+        event_type: RuntimeEventType,
+        comm: &str,
+        argv: &[&str],
+        argv_complete: bool,
+        argv_truncated: bool,
+        argv_read_error: bool,
+        filename_truncated: bool,
+        filename_read_error: bool,
+    ) -> EvidenceRecord {
         EvidenceRecord::RuntimeEvent(EvidenceEvent {
             session_id: session_id.to_owned(),
             seq_no,
@@ -658,11 +738,11 @@ mod tests {
                 comm: comm.to_owned(),
                 exe_path: exe_path.to_owned(),
                 argv: argv.iter().map(|value| value.to_string()).collect(),
-                argv_complete: !argv.is_empty(),
-                argv_truncated: false,
-                argv_read_error: false,
-                filename_truncated: false,
-                filename_read_error: false,
+                argv_complete,
+                argv_truncated,
+                argv_read_error,
+                filename_truncated,
+                filename_read_error,
             },
             classification: EventClassification::Acceptable,
             rule_id: String::from("test"),
@@ -1015,7 +1095,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_attempt_invocations_are_metadata_only_and_count_duplicates() {
+    fn complete_exec_attempt_invocations_train_exact_argv_policy_and_count_duplicates() {
         let files = TestFiles::new("exec-attempt-metadata");
         files.write(
             SESSION_A,
@@ -1073,6 +1153,72 @@ mod tests {
         );
         assert_eq!(output.policy.acceptable.exec_paths, vec!["/usr/bin/echo"]);
         assert_eq!(output.policy.acceptable.event_types, vec!["exec"]);
+        assert_eq!(
+            output.policy.acceptable.argv_sensitive_exec_paths,
+            vec![String::from("/usr/local/bin/python")]
+        );
+        assert_eq!(output.policy.acceptable.allowed_invocations.len(), 1);
+        assert_eq!(
+            output.policy.acceptable.allowed_invocations[0].exe_path,
+            "/usr/local/bin/python"
+        );
+        assert_eq!(
+            output.policy.acceptable.allowed_invocations[0].argv,
+            vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("uvicorn"),
+                String::from("app:app")
+            ]
+        );
+        assert_eq!(
+            output.policy.acceptable.allowed_invocations[0].match_type,
+            InvocationMatchType::Exact
+        );
+        assert_eq!(output.metadata.skipped_incomplete_argv_invocation_count, 0);
+    }
+
+    fn assert_incomplete_argv_invocation_is_skipped(
+        name: &str,
+        argv_complete: bool,
+        argv_truncated: bool,
+        argv_read_error: bool,
+        filename_truncated: bool,
+        filename_read_error: bool,
+    ) {
+        let files = TestFiles::new(name);
+        files.write(
+            SESSION_A,
+            &[
+                runtime_record(
+                    SESSION_A,
+                    1,
+                    Some("workload-a"),
+                    "/usr/bin/echo",
+                    RuntimeEventType::Exec,
+                    "echo",
+                ),
+                runtime_record_with_argv_quality(
+                    SESSION_A,
+                    2,
+                    Some("workload-a"),
+                    "/usr/local/bin/python",
+                    RuntimeEventType::ExecAttempt,
+                    "python",
+                    &["python", "-m", "uvicorn", "app:app"],
+                    argv_complete,
+                    argv_truncated,
+                    argv_read_error,
+                    filename_truncated,
+                    filename_read_error,
+                ),
+            ],
+            2,
+        );
+
+        let output = train(&[&files], None);
+
+        assert_eq!(output.policy.acceptable.exec_paths, vec!["/usr/bin/echo"]);
         assert!(
             output
                 .policy
@@ -1081,10 +1227,69 @@ mod tests {
                 .is_empty()
         );
         assert!(output.policy.acceptable.allowed_invocations.is_empty());
-        let policy_json = serde_json::to_string(&output.policy).expect("policy");
-        assert!(!policy_json.contains("argv"));
-        assert!(!policy_json.contains("argv_sensitive_exec_paths"));
-        assert!(!policy_json.contains("allowed_invocations"));
+        assert!(output.metadata.observed_exec_attempt_invocations.is_empty());
+        assert!(output.metadata.observed_interpreter_invocations.is_empty());
+        assert_eq!(output.metadata.skipped_incomplete_argv_invocation_count, 1);
+    }
+
+    #[test]
+    fn argv_complete_false_exec_attempt_is_skipped_for_exact_argv_training() {
+        assert_incomplete_argv_invocation_is_skipped(
+            "argv-incomplete",
+            false,
+            false,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn argv_truncated_exec_attempt_is_skipped_for_exact_argv_training() {
+        assert_incomplete_argv_invocation_is_skipped(
+            "argv-truncated",
+            true,
+            true,
+            false,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn argv_read_error_exec_attempt_is_skipped_for_exact_argv_training() {
+        assert_incomplete_argv_invocation_is_skipped(
+            "argv-read-error",
+            true,
+            false,
+            true,
+            false,
+            false,
+        );
+    }
+
+    #[test]
+    fn filename_truncated_exec_attempt_is_skipped_for_exact_argv_training() {
+        assert_incomplete_argv_invocation_is_skipped(
+            "filename-truncated",
+            true,
+            false,
+            false,
+            true,
+            false,
+        );
+    }
+
+    #[test]
+    fn filename_read_error_exec_attempt_is_skipped_for_exact_argv_training() {
+        assert_incomplete_argv_invocation_is_skipped(
+            "filename-read-error",
+            true,
+            false,
+            false,
+            false,
+            true,
+        );
     }
 
     #[test]
