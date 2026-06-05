@@ -1,4 +1,4 @@
-use crate::{Event, EventType, MAX_ARGS, UNKNOWN_WORKLOAD_INDEX};
+use crate::{Event, EventType, FILENAME_TRUNCATED, MAX_ARGS, UNKNOWN_WORKLOAD_INDEX};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
@@ -235,6 +235,21 @@ pub struct RuntimeEvent {
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub argv: Vec<String>,
+
+    #[serde(default)]
+    pub argv_complete: bool,
+
+    #[serde(default)]
+    pub argv_truncated: bool,
+
+    #[serde(default)]
+    pub argv_read_error: bool,
+
+    #[serde(default)]
+    pub filename_truncated: bool,
+
+    #[serde(default)]
+    pub filename_read_error: bool,
 }
 
 impl RuntimeEvent {
@@ -252,6 +267,11 @@ impl RuntimeEvent {
             comm: bytes_to_lossy_string(&raw.comm),
             exe_path: bytes_to_lossy_string_len(&raw.filename, raw.filename_len),
             argv: argv_from_raw_event(raw),
+            argv_complete: raw.argv_complete != 0,
+            argv_truncated: raw.argv_truncated != 0,
+            argv_read_error: raw.argv_read_error != 0,
+            filename_truncated: raw.filename_flags & FILENAME_TRUNCATED != 0,
+            filename_read_error: raw.filename_read_error != 0,
         }
     }
 
@@ -274,6 +294,11 @@ impl RuntimeEvent {
         encode_str(&mut buf, &self.comm);
         encode_str(&mut buf, &self.exe_path);
         encode_str_list(&mut buf, &self.argv);
+        encode_bool(&mut buf, self.argv_complete);
+        encode_bool(&mut buf, self.argv_truncated);
+        encode_bool(&mut buf, self.argv_read_error);
+        encode_bool(&mut buf, self.filename_truncated);
+        encode_bool(&mut buf, self.filename_read_error);
 
         buf
     }
@@ -921,6 +946,16 @@ fn classify_argv_sensitive_invocation(
         return None;
     }
 
+    if !event.argv_evidence_complete_for_sensitive_match() {
+        return Some(ClassificationResult {
+            classification: EventClassification::Suspicious,
+            rule_id: String::from("argv-sensitive-incomplete-evidence"),
+            reason: String::from(
+                "argv-sensitive rule requires complete argv and filename evidence",
+            ),
+        });
+    }
+
     if let Some(reason) = acceptable_by_allowed_invocation(event, policy) {
         return Some(ClassificationResult {
             classification: EventClassification::Acceptable,
@@ -937,6 +972,16 @@ fn classify_argv_sensitive_invocation(
             event.exe_path
         ),
     })
+}
+
+impl RuntimeEvent {
+    fn argv_evidence_complete_for_sensitive_match(&self) -> bool {
+        self.argv_complete
+            && !self.argv_truncated
+            && !self.argv_read_error
+            && !self.filename_truncated
+            && !self.filename_read_error
+    }
 }
 
 fn is_argv_sensitive_exec_path(exe_path: &str, policy: &RuntimePolicy) -> bool {
@@ -1035,7 +1080,7 @@ fn policy_canonical_bytes(policy: &RuntimePolicy) -> Vec<u8> {
 #[cfg(all(test, feature = "user"))]
 mod tests {
     use super::*;
-    use crate::{ARG_LEN, MAX_ARGS};
+    use crate::{ARG_LEN, MAX_ARGS, PATH_LEN, TASK_COMM_LEN};
     use bytemuck::Zeroable;
     use core::mem;
     use std::vec;
@@ -1054,6 +1099,11 @@ mod tests {
             comm: String::from("python"),
             exe_path: String::from("/usr/local/bin/python"),
             argv: Vec::new(),
+            argv_complete: false,
+            argv_truncated: false,
+            argv_read_error: false,
+            filename_truncated: false,
+            filename_read_error: false,
         }
     }
 
@@ -1080,6 +1130,35 @@ mod tests {
             },
             attestation: AttestationPolicy::default(),
         }
+    }
+
+    fn argv_sensitive_policy() -> RuntimePolicy {
+        let mut policy = sample_policy();
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("uvicorn"),
+                String::from("app:app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        policy
+    }
+
+    fn complete_argv_sensitive_event() -> RuntimeEvent {
+        let mut event = sample_event();
+        event.event_type = RuntimeEventType::ExecAttempt;
+        event.argv = vec![
+            String::from("python"),
+            String::from("-m"),
+            String::from("uvicorn"),
+            String::from("app:app"),
+        ];
+        event.argv_complete = true;
+        event
     }
 
     #[test]
@@ -1133,6 +1212,19 @@ mod tests {
     }
 
     #[test]
+    fn event_hash_depends_on_argv_complete() {
+        let left_event = sample_event();
+        let mut right_event = sample_event();
+        right_event.argv_complete = true;
+        let session = [7u8; 32];
+
+        assert_ne!(
+            event_hash(&session, 1, &left_event),
+            event_hash(&session, 1, &right_event)
+        );
+    }
+
+    #[test]
     fn raw_event_remains_pod_zeroable_and_aligned() {
         assert_pod::<Event>();
         let event = Event::zeroed();
@@ -1140,6 +1232,16 @@ mod tests {
         assert_eq!(event.argc, 0);
         assert_eq!(argv_from_raw_event(&event), Vec::<String>::new());
         assert!(mem::align_of::<Event>() <= 8);
+        assert_eq!(
+            mem::size_of::<Event>(),
+            4 * mem::size_of::<u64>()
+                + 12 * mem::size_of::<u32>()
+                + TASK_COMM_LEN
+                + PATH_LEN
+                + 2 * mem::size_of::<u32>()
+                + MAX_ARGS * ARG_LEN
+                + 4 * mem::size_of::<u32>()
+        );
     }
 
     #[test]
@@ -1159,6 +1261,103 @@ mod tests {
         assert_eq!(argv[1], "app.py");
         assert_eq!(argv[2].len(), ARG_LEN);
         assert_eq!(argv[3], String::from_utf8_lossy(&[0xff, 0xfe]).into_owned());
+    }
+
+    #[test]
+    fn raw_exec_event_maps_to_conservative_argv_metadata() {
+        let mut event = Event::zeroed();
+        event.event_type = EventType::Exec as u32;
+
+        let runtime_event = RuntimeEvent::from_raw_event(&event, Some(String::from("fastapi")));
+
+        assert!(!runtime_event.argv_complete);
+        assert!(!runtime_event.argv_truncated);
+        assert!(!runtime_event.argv_read_error);
+    }
+
+    #[test]
+    fn complete_raw_exec_attempt_maps_to_complete_runtime_event() {
+        let mut event = Event::zeroed();
+        event.event_type = EventType::ExecAttempt as u32;
+        event.argc = 2;
+        event.argv[0][..6].copy_from_slice(b"python");
+        event.argv[1][..2].copy_from_slice(b"-m");
+        event.argv_complete = 1;
+
+        let runtime_event = RuntimeEvent::from_raw_event(&event, Some(String::from("fastapi")));
+
+        assert_eq!(
+            runtime_event.argv,
+            vec![String::from("python"), String::from("-m")]
+        );
+        assert!(runtime_event.argv_complete);
+        assert!(!runtime_event.argv_truncated);
+        assert!(!runtime_event.argv_read_error);
+    }
+
+    #[test]
+    fn max_args_without_null_maps_to_truncated_incomplete_runtime_event() {
+        let mut event = Event::zeroed();
+        event.event_type = EventType::ExecAttempt as u32;
+        event.argc = MAX_ARGS as u32;
+        event.argv_truncated = 1;
+
+        let runtime_event = RuntimeEvent::from_raw_event(&event, Some(String::from("fastapi")));
+
+        assert_eq!(runtime_event.argv.len(), MAX_ARGS);
+        assert!(!runtime_event.argv_complete);
+        assert!(runtime_event.argv_truncated);
+        assert!(!runtime_event.argv_read_error);
+    }
+
+    #[test]
+    fn raw_argv_read_failure_maps_to_read_error_incomplete_runtime_event() {
+        let mut event = Event::zeroed();
+        event.event_type = EventType::ExecAttempt as u32;
+        event.argc = 1;
+        event.argv_read_error = -14;
+
+        let runtime_event = RuntimeEvent::from_raw_event(&event, Some(String::from("fastapi")));
+
+        assert!(!runtime_event.argv_complete);
+        assert!(!runtime_event.argv_truncated);
+        assert!(runtime_event.argv_read_error);
+    }
+
+    #[test]
+    fn raw_argument_string_truncation_maps_to_truncated_runtime_event() {
+        let mut event = Event::zeroed();
+        event.event_type = EventType::ExecAttempt as u32;
+        event.argc = 1;
+        event.argv[0].fill(b'a');
+        event.argv_truncated = 1;
+
+        let runtime_event = RuntimeEvent::from_raw_event(&event, Some(String::from("fastapi")));
+
+        assert!(!runtime_event.argv_complete);
+        assert!(runtime_event.argv_truncated);
+        assert!(!runtime_event.argv_read_error);
+    }
+
+    #[test]
+    fn raw_complete_argv_sensitive_event_classifies_acceptable() {
+        let policy = argv_sensitive_policy();
+        let mut event = Event::zeroed();
+        event.event_type = EventType::ExecAttempt as u32;
+        event.argv_complete = 1;
+        event.argc = 4;
+        event.filename[..21].copy_from_slice(b"/usr/local/bin/python");
+        event.filename_len = 21;
+        event.argv[0][..6].copy_from_slice(b"python");
+        event.argv[1][..2].copy_from_slice(b"-m");
+        event.argv[2][..7].copy_from_slice(b"uvicorn");
+        event.argv[3][..7].copy_from_slice(b"app:app");
+        let runtime_event = RuntimeEvent::from_raw_event(&event, Some(String::from("fastapi")));
+
+        let result = classify_event(&runtime_event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Acceptable);
+        assert_eq!(result.rule_id, "acceptable-argv-invocation");
     }
 
     #[test]
@@ -1583,32 +1782,92 @@ mod tests {
     }
 
     #[test]
+    fn old_runtime_event_json_defaults_to_incomplete_argv_evidence() {
+        let json = r#"{
+            "event_type": "exec-attempt",
+            "timestamp_ns": 42,
+            "cgroup_id": 99,
+            "pid": 123,
+            "tgid": 123,
+            "ppid": 1,
+            "cpu": 2,
+            "comm": "python",
+            "exe_path": "/usr/local/bin/python",
+            "argv": ["python", "-m", "app"]
+        }"#;
+
+        let event = serde_json::from_str::<RuntimeEvent>(json).expect("event");
+
+        assert!(!event.argv_complete);
+        assert!(!event.argv_truncated);
+        assert!(!event.argv_read_error);
+        assert!(!event.filename_truncated);
+        assert!(!event.filename_read_error);
+    }
+
+    #[test]
     fn argv_sensitive_exact_invocation_is_acceptable() {
-        let mut policy = sample_policy();
-        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
-        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
-            exe_path: String::from("/usr/local/bin/python"),
-            argv: vec![
-                String::from("python"),
-                String::from("-m"),
-                String::from("uvicorn"),
-                String::from("app:app"),
-            ],
-            match_type: InvocationMatchType::Exact,
-        }];
-        let mut event = sample_event();
-        event.event_type = RuntimeEventType::ExecAttempt;
-        event.argv = vec![
-            String::from("python"),
-            String::from("-m"),
-            String::from("uvicorn"),
-            String::from("app:app"),
-        ];
+        let policy = argv_sensitive_policy();
+        let event = complete_argv_sensitive_event();
 
         let result = classify_event(&event, &policy);
 
         assert_eq!(result.classification, EventClassification::Acceptable);
         assert_eq!(result.rule_id, "acceptable-argv-invocation");
+    }
+
+    fn assert_argv_sensitive_incomplete_evidence_is_suspicious(event: RuntimeEvent) {
+        let policy = argv_sensitive_policy();
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Suspicious);
+        assert_eq!(result.rule_id, "argv-sensitive-incomplete-evidence");
+        assert!(
+            result
+                .reason
+                .contains("requires complete argv and filename evidence")
+        );
+    }
+
+    #[test]
+    fn argv_sensitive_incomplete_argv_is_suspicious() {
+        let mut event = complete_argv_sensitive_event();
+        event.argv_complete = false;
+
+        assert_argv_sensitive_incomplete_evidence_is_suspicious(event);
+    }
+
+    #[test]
+    fn argv_sensitive_truncated_argv_is_suspicious() {
+        let mut event = complete_argv_sensitive_event();
+        event.argv_truncated = true;
+
+        assert_argv_sensitive_incomplete_evidence_is_suspicious(event);
+    }
+
+    #[test]
+    fn argv_sensitive_argv_read_error_is_suspicious() {
+        let mut event = complete_argv_sensitive_event();
+        event.argv_read_error = true;
+
+        assert_argv_sensitive_incomplete_evidence_is_suspicious(event);
+    }
+
+    #[test]
+    fn argv_sensitive_truncated_filename_is_suspicious() {
+        let mut event = complete_argv_sensitive_event();
+        event.filename_truncated = true;
+
+        assert_argv_sensitive_incomplete_evidence_is_suspicious(event);
+    }
+
+    #[test]
+    fn argv_sensitive_filename_read_error_is_suspicious() {
+        let mut event = complete_argv_sensitive_event();
+        event.filename_read_error = true;
+
+        assert_argv_sensitive_incomplete_evidence_is_suspicious(event);
     }
 
     #[test]
@@ -1660,6 +1919,7 @@ mod tests {
             String::from("-c"),
             String::from("print(1)"),
         ];
+        event.argv_complete = true;
 
         let result = classify_event(&event, &policy);
 
@@ -1680,7 +1940,8 @@ mod tests {
             ],
             match_type: InvocationMatchType::Exact,
         }];
-        let event = sample_event();
+        let mut event = sample_event();
+        event.argv_complete = true;
 
         let result = classify_event(&event, &policy);
 
@@ -1700,6 +1961,21 @@ mod tests {
 
         assert_eq!(result.classification, EventClassification::Acceptable);
         assert_eq!(result.rule_id, "acceptable-argv-invocation");
+    }
+
+    #[test]
+    fn denied_exec_path_overrides_matching_argv_sensitive_invocation() {
+        let mut policy = argv_sensitive_policy();
+        policy
+            .denied
+            .exec_paths
+            .push(String::from("/usr/local/bin/python"));
+        let event = complete_argv_sensitive_event();
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Denied);
+        assert_eq!(result.rule_id, "deny-exec-path");
     }
 
     #[test]

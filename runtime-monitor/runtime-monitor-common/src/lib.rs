@@ -73,11 +73,15 @@ pub struct Event {
     pub argc: u32,
     pub argv_reserved: u32,
     /// Bounded argv snapshot for exec-attempt evidence.
-    ///
-    /// Entries may be truncated to ARG_LEN. Exact argv-sensitive enforcement
-    /// should wait until the evidence format carries explicit truncation
-    /// metadata for individual argv entries.
     pub argv: [[u8; ARG_LEN]; MAX_ARGS],
+
+    /// True when argv walking reached a NULL argv pointer.
+    pub argv_complete: u32,
+    /// True when argv exceeded MAX_ARGS or an argument was truncated.
+    pub argv_truncated: u32,
+    /// Nonzero when reading an argv pointer or argument failed.
+    pub argv_read_error: i32,
+    pub argv_reserved2: u32,
 }
 // Optional: userspace-only convenience impls can live behind cfg(feature = "user")
 

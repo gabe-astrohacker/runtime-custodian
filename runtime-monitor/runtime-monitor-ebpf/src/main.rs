@@ -236,32 +236,71 @@ fn emit_event(
         ptr::addr_of_mut!((*event).filename_read_error).write(filename_read_error);
         ptr::addr_of_mut!((*event).reserved).write(0);
         ptr::addr_of_mut!((*event).reserved2).write(0);
+        ptr::addr_of_mut!((*event).argv_complete).write(0);
+        ptr::addr_of_mut!((*event).argv_truncated).write(0);
+        ptr::addr_of_mut!((*event).argv_read_error).write(0);
+        ptr::addr_of_mut!((*event).argv_reserved2).write(0);
 
-        if event_type as u32 == EventType::ExecAttempt as u32 && !argv_ptr.is_null() {
-            // argc records copied entries only, not the true process argc. Each
-            // string read is bounded by ARG_LEN and may be truncated; exact
-            // argv enforcement should wait for per-argument truncation metadata.
+        if event_type as u32 == EventType::ExecAttempt as u32 {
             let mut argc = 0u32;
+            let mut argv_complete = 0u32;
+            let mut argv_truncated = 0u32;
+            let mut argv_read_error = 0i32;
             let argv_base = ptr::addr_of_mut!((*event).argv).cast::<u8>();
 
-            for i in 0..MAX_ARGS {
-                let arg_ptr_ptr = argv_ptr.add(i);
-                let arg_ptr = match bpf_probe_read_user::<*const u8>(arg_ptr_ptr) {
-                    Ok(arg_ptr) => arg_ptr,
-                    Err(_) => break,
-                };
-                if arg_ptr.is_null() {
-                    break;
+            if argv_ptr.is_null() {
+                argv_read_error = -1;
+            } else {
+                for i in 0..MAX_ARGS {
+                    let arg_ptr_ptr = argv_ptr.add(i);
+                    let arg_ptr = match bpf_probe_read_user::<*const u8>(arg_ptr_ptr) {
+                        Ok(arg_ptr) => arg_ptr,
+                        Err(error) => {
+                            argv_read_error = error as i32;
+                            break;
+                        }
+                    };
+                    if arg_ptr.is_null() {
+                        argv_complete = 1;
+                        break;
+                    }
+
+                    let arg_dst =
+                        core::slice::from_raw_parts_mut(argv_base.add(i * ARG_LEN), ARG_LEN);
+                    match bpf_probe_read_user_str_bytes(arg_ptr, arg_dst) {
+                        Ok(bytes) => {
+                            if bytes.len() >= ARG_LEN - 1 {
+                                argv_truncated = 1;
+                            }
+                            argc += 1;
+                        }
+                        Err(error) => {
+                            argv_read_error = error as i32;
+                            break;
+                        }
+                    }
                 }
 
-                let arg_dst = core::slice::from_raw_parts_mut(argv_base.add(i * ARG_LEN), ARG_LEN);
-                if bpf_probe_read_user_str_bytes(arg_ptr, arg_dst).is_err() {
-                    break;
+                if argv_complete == 0 && argv_read_error == 0 && argc == MAX_ARGS as u32 {
+                    match bpf_probe_read_user::<*const u8>(argv_ptr.add(MAX_ARGS)) {
+                        Ok(next_ptr) => {
+                            if next_ptr.is_null() {
+                                argv_complete = 1;
+                            } else {
+                                argv_truncated = 1;
+                            }
+                        }
+                        Err(error) => {
+                            argv_read_error = error as i32;
+                        }
+                    }
                 }
-                argc += 1;
             }
 
             ptr::addr_of_mut!((*event).argc).write(argc);
+            ptr::addr_of_mut!((*event).argv_complete).write(argv_complete);
+            ptr::addr_of_mut!((*event).argv_truncated).write(argv_truncated);
+            ptr::addr_of_mut!((*event).argv_read_error).write(argv_read_error);
         }
     }
 

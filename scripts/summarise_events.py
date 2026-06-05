@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 import argparse
 import collections
-import json
 from pathlib import Path
+
+from integration_lib import IntegrationFailure, iter_runtime_evidence_events
 
 
 def key(value):
@@ -22,25 +23,28 @@ def main():
     counts = collections.Counter()
     total = 0
 
-    with evidence.open("r", encoding="utf-8") as handle:
-        for line_no, line in enumerate(handle, 1):
-            if not line.strip():
-                continue
-            event = json.loads(line)
+    try:
+        for runtime_event in iter_runtime_evidence_events(evidence):
+            event = runtime_event.event
+            record = runtime_event.record
             total += 1
             counts[
                 (
+                    key(event.get("event_type")),
                     key(event.get("exe_path")),
                     key(event.get("comm")),
                     key(event.get("cgroup_id")),
                     key(event.get("workload_id")),
+                    key(record.get("classification")),
                 )
             ] += 1
+    except IntegrationFailure as exc:
+        raise SystemExit(str(exc)) from exc
 
     print(f"events={total}")
-    print("count\texe_path\tcomm\tcgroup_id\tworkload_id")
-    for (exe_path, comm, cgroup_id, workload_id), count in counts.most_common():
-        print(f"{count}\t{exe_path}\t{comm}\t{cgroup_id}\t{workload_id}")
+    print("count\tevent_type\texe_path\tcomm\tcgroup_id\tworkload_id\tclassification")
+    for (event_type, exe_path, comm, cgroup_id, workload_id, classification), count in counts.most_common():
+        print(f"{count}\t{event_type}\t{exe_path}\t{comm}\t{cgroup_id}\t{workload_id}\t{classification}")
 
 
 if __name__ == "__main__":

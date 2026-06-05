@@ -18,7 +18,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping, TextIO
+from typing import Any, Iterator, Mapping, TextIO
 
 
 class IntegrationFailure(RuntimeError):
@@ -115,6 +115,95 @@ class CasePaths:
     evidence: Path
     summary: Path
     monitor_log: Path
+
+
+@dataclass(frozen=True)
+class EvidenceJsonRecord:
+    line_number: int
+    data: Mapping[str, Any]
+
+
+@dataclass(frozen=True)
+class RuntimeEvidenceEvent:
+    line_number: int
+    record: Mapping[str, Any]
+    event: Mapping[str, Any]
+    legacy: bool
+
+
+LEGACY_RUNTIME_EVENT_DETAIL_FIELDS = frozenset(("exe_path", "comm", "workload_id", "cgroup_id"))
+
+
+def is_legacy_runtime_event(data: Mapping[str, Any]) -> bool:
+    return "event_type" in data and bool(LEGACY_RUNTIME_EVENT_DETAIL_FIELDS.intersection(data))
+
+
+def iter_evidence_records(path: Path) -> Iterator[EvidenceJsonRecord]:
+    with path.open(encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            if not line.strip():
+                continue
+
+            try:
+                data = json.loads(line)
+            except json.JSONDecodeError as exc:
+                fail(f"invalid JSON in {path} at line {line_number}: {exc}")
+
+            if not isinstance(data, dict):
+                fail(f"invalid evidence record in {path} at line {line_number}: expected JSON object")
+
+            yield EvidenceJsonRecord(line_number=line_number, data=data)
+
+
+def iter_runtime_evidence_events(path: Path) -> Iterator[RuntimeEvidenceEvent]:
+    for parsed in iter_evidence_records(path):
+        data = parsed.data
+        record_kind = data.get("record_kind")
+
+        # Synthetic records are valid evidence records, but runtime event
+        # summaries intentionally exclude monitor lifecycle/policy metadata.
+        if record_kind == "synthetic":
+            continue
+
+        if record_kind == "runtime-event":
+            record = data.get("record")
+            if not isinstance(record, dict):
+                fail(
+                    f"invalid runtime evidence record in {path} at line {parsed.line_number}: "
+                    "missing object field 'record'"
+                )
+
+            event = record.get("event")
+            if not isinstance(event, dict):
+                fail(
+                    f"invalid runtime evidence record in {path} at line {parsed.line_number}: "
+                    "missing object field 'record.event'"
+                )
+
+            yield RuntimeEvidenceEvent(
+                line_number=parsed.line_number,
+                record=record,
+                event=event,
+                legacy=False,
+            )
+            continue
+
+        if record_kind is not None:
+            fail(f"unsupported evidence record_kind in {path} at line {parsed.line_number}: {record_kind}")
+
+        if is_legacy_runtime_event(data):
+            yield RuntimeEvidenceEvent(
+                line_number=parsed.line_number,
+                record=data,
+                event=data,
+                legacy=True,
+            )
+            continue
+
+        fail(
+            f"unsupported evidence record in {path} at line {parsed.line_number}: "
+            "missing record_kind and not a legacy runtime event"
+        )
 
 
 class CommandRunner:
@@ -422,13 +511,15 @@ class RuntimeHarness:
         except json.JSONDecodeError as exc:
             fail(f"collector config is not valid JSON: {self.settings.base_collector_config}: {exc}")
 
-        # Force test-specific evidence output so stale/default logs cannot
-        # satisfy assertions accidentally. Preserve all other collector fields.
-        config["evidence_out"] = str(paths.evidence)
         config.setdefault("collection_mode", "scoped")
 
         if overrides:
             config.update(overrides)
+
+        # Force test-specific outputs so stale/default evidence or summary
+        # files cannot satisfy assertions accidentally.
+        config["evidence_out"] = str(paths.evidence)
+        config["summary_out"] = str(paths.summary)
 
         paths.collector_config.write_text(
             json.dumps(config, indent=2, sort_keys=True) + "\n",

@@ -28,7 +28,14 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from integration_lib import IntegrationFailure, RuntimeHarness, Settings, fail, log
+from integration_lib import (
+    IntegrationFailure,
+    RuntimeHarness,
+    Settings,
+    fail,
+    iter_runtime_evidence_events,
+    log,
+)
 
 
 @dataclass(frozen=True)
@@ -441,26 +448,26 @@ def summarise_evidence(paths: Any, *, top_n: int) -> dict[str, Any]:
     event_type_counts: collections.Counter[str] = collections.Counter()
     workload_counts: collections.Counter[str] = collections.Counter()
     exe_path_counts: collections.Counter[str] = collections.Counter()
+    classification_counts: collections.Counter[str] = collections.Counter()
 
-    with paths.evidence.open(encoding="utf-8") as handle:
-        for line_number, line in enumerate(handle, start=1):
-            if not line.strip():
-                continue
+    for runtime_event in iter_runtime_evidence_events(paths.evidence):
+        event = runtime_event.event
+        record = runtime_event.record
 
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError as exc:
-                fail(f"invalid JSON in {paths.evidence} at line {line_number}: {exc}")
+        event_count += 1
+        event_type_counts[str(event.get("event_type", "<missing>"))] += 1
+        workload_counts[str(event.get("workload_id", "<missing>"))] += 1
+        exe_path_counts[str(event.get("exe_path") or "<missing>")] += 1
 
-            event_count += 1
-            event_type_counts[str(event.get("event_type", "<missing>"))] += 1
-            workload_counts[str(event.get("workload_id", "<missing>"))] += 1
-            exe_path_counts[str(event.get("exe_path") or "<missing>")] += 1
+        classification = record.get("classification")
+        if classification is not None:
+            classification_counts[str(classification)] += 1
 
     return {
         "event_count": event_count,
         "event_type_counts": dict(event_type_counts.most_common()),
         "workload_counts": dict(workload_counts.most_common()),
+        "classification_counts": dict(classification_counts.most_common()),
         "top_exec_paths": [
             {"exe_path": exe_path, "count": count}
             for exe_path, count in exe_path_counts.most_common(top_n)

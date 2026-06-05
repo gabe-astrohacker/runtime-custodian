@@ -1,13 +1,42 @@
 {
-    "workload_id": "fastapi-echo",
-    "allowed_exec_paths": [
-        "/usr/local/bin/python",
-        "/usr/bin/echo"
+  "workload_id": "fastapi-echo",
+  "profile_mode": "minimal-behaviour",
+  "acceptable": {
+    "exec_paths": [
+      "/usr/local/bin/python",
+      "/usr/bin/echo"
     ],
-    "forbidden_exec_paths": [
-        "/usr/bin/id",
-        "/bin/sh",
-        "/bin/bash"
+    "event_types": [
+      "fork"
+    ]
+  },
+  "suspicious": {
+    "unknown_exec_path": true
+  },
+  "denied": {
+    "exec_paths": [
+      "/usr/bin/id",
+      "/bin/sh",
+      "/bin/bash",
+      "/usr/bin/curl",
+      "/usr/bin/wget",
+      "/bin/nc",
+      "/usr/bin/nc"
     ],
-    "default_action": "deny"
+    "comm_names": [
+      "id",
+      "sh",
+      "bash",
+      "curl",
+      "wget",
+      "nc"
+    ]
+  },
+  "attestation": {
+    "backend": "none",
+    "mode": "software-chain",
+    "fail_on_suspicious": false,
+    "fail_on_denied": true,
+    "fail_on_drops": true
+  }
 }

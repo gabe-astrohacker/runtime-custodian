@@ -1871,6 +1871,10 @@ mod tests {
             argc: 0,
             argv_reserved: 0,
             argv: [[0; ARG_LEN]; MAX_ARGS],
+            argv_complete: 0,
+            argv_truncated: 0,
+            argv_read_error: 0,
+            argv_reserved2: 0,
         };
 
         let comm = b"echo";
@@ -1888,6 +1892,7 @@ mod tests {
         let mut event = sample_raw_event(exe_path);
         event.event_type = EventType::ExecAttempt as u32;
         event.argc = u32::try_from(argv.len()).expect("argc");
+        event.argv_complete = 1;
         for (idx, arg) in argv.iter().enumerate() {
             assert!(idx < MAX_ARGS);
             let bytes = arg.as_bytes();
@@ -2076,6 +2081,9 @@ mod tests {
         let jsonl = fs::read_to_string(&evidence_out).expect("evidence");
         assert!(jsonl.contains("\"event_type\":\"exec-attempt\""));
         assert!(jsonl.contains("\"argv\":[\"python\",\"-m\",\"app\"]"));
+        assert!(jsonl.contains("\"argv_complete\":true"));
+        assert!(jsonl.contains("\"argv_truncated\":false"));
+        assert!(jsonl.contains("\"argv_read_error\":false"));
 
         let _ = fs::remove_file(evidence_out);
         let _ = fs::remove_file(summary_out);

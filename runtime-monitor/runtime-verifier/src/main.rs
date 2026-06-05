@@ -77,6 +77,7 @@ struct VerificationChecks {
     software_chain_valid: bool,
     counts_valid: bool,
     lifecycle_valid: bool,
+    workload_identity_valid: bool,
     drop_policy_valid: bool,
     tpm_metadata_valid: bool,
     tpm_summary_valid: bool,
@@ -97,6 +98,7 @@ impl VerificationChecks {
             software_chain_valid: true,
             counts_valid: true,
             lifecycle_valid: true,
+            workload_identity_valid: true,
             drop_policy_valid: true,
             tpm_metadata_valid: true,
             tpm_summary_valid: true,
@@ -117,6 +119,7 @@ impl VerificationChecks {
             software_chain_valid: false,
             counts_valid: false,
             lifecycle_valid: false,
+            workload_identity_valid: false,
             drop_policy_valid: false,
             tpm_metadata_valid: false,
             tpm_summary_valid: false,
@@ -403,6 +406,8 @@ where
         ));
     }
 
+    validate_summary_workload_identity(policy, summary, &mut checks, &mut structural_reasons);
+
     let session_id = decode_hex_32_field(
         &summary.session_id,
         "summary.session_id",
@@ -497,6 +502,13 @@ where
                         event.seq_no
                     ));
                 }
+                validate_runtime_event_workload_identity(
+                    event,
+                    policy,
+                    summary,
+                    &mut checks,
+                    &mut structural_reasons,
+                );
                 replay_runtime_event(
                     event,
                     policy,
@@ -596,6 +608,64 @@ where
         first_denied_event,
         checks,
     )
+}
+
+fn validate_summary_workload_identity(
+    policy: &RuntimePolicy,
+    summary: &RuntimeSummary,
+    checks: &mut VerificationChecks,
+    structural_reasons: &mut Vec<String>,
+) {
+    match summary.collection_mode.as_str() {
+        "scoped" | "host-wide" => {}
+        other => {
+            checks.workload_identity_valid = false;
+            structural_reasons.push(format!(
+                "unknown collection_mode for workload identity check: {other}"
+            ));
+        }
+    }
+
+    if policy.workload_id.is_empty() || summary.workload_id == policy.workload_id {
+        return;
+    }
+
+    checks.workload_identity_valid = false;
+    structural_reasons.push(format!(
+        "summary workload_id mismatch: expected {} got {}",
+        policy.workload_id, summary.workload_id
+    ));
+}
+
+fn validate_runtime_event_workload_identity(
+    event: &EvidenceEvent,
+    policy: &RuntimePolicy,
+    summary: &RuntimeSummary,
+    checks: &mut VerificationChecks,
+    structural_reasons: &mut Vec<String>,
+) {
+    if policy.workload_id.is_empty() {
+        return;
+    }
+
+    match summary.collection_mode.as_str() {
+        "scoped" => {}
+        "host-wide" => return,
+        _ => return,
+    }
+
+    let actual = event.event.workload_id.as_deref();
+    if actual == Some(policy.workload_id.as_str()) {
+        return;
+    }
+
+    checks.workload_identity_valid = false;
+    structural_reasons.push(format!(
+        "runtime event workload_id mismatch at seq_no {}: expected {} got {}",
+        event.seq_no,
+        policy.workload_id,
+        actual.unwrap_or("<missing>")
+    ));
 }
 
 #[derive(Default)]
@@ -1907,6 +1977,11 @@ mod tests {
             comm: String::from("echo"),
             exe_path: exe_path.to_owned(),
             argv: Vec::new(),
+            argv_complete: false,
+            argv_truncated: false,
+            argv_read_error: false,
+            filename_truncated: false,
+            filename_read_error: false,
         }
     }
 
@@ -1914,6 +1989,7 @@ mod tests {
         let mut event = runtime_event(exe_path);
         event.event_type = RuntimeEventType::ExecAttempt;
         event.argv = argv.into_iter().map(String::from).collect();
+        event.argv_complete = true;
         event
     }
 
@@ -2110,6 +2186,106 @@ mod tests {
         assert_eq!(report.decision, VerificationDecision::Accept);
         assert_eq!(report.counts.acceptable, 1);
         assert_eq!(report.counts.synthetic, 4);
+    }
+
+    #[test]
+    fn summary_workload_id_must_match_policy_workload_id() {
+        let policy = base_policy();
+        let (events, mut summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+        summary.workload_id = String::from("other");
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.workload_identity_valid);
+        assert!(report.reason.contains("summary workload_id mismatch"));
+        assert!(report.reason.contains("expected workload-a got other"));
+    }
+
+    #[test]
+    fn scoped_runtime_event_workload_id_must_match_policy_workload_id() {
+        let policy = base_policy();
+        let mut event = runtime_event("/usr/bin/echo");
+        event.workload_id = Some(String::from("other"));
+        let (events, summary) = evidence_fixture(&policy, vec![event]);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.workload_identity_valid);
+        assert!(report.reason.contains(
+            "runtime event workload_id mismatch at seq_no 4: expected workload-a got other"
+        ));
+        assert!(report.checks.event_hashes_valid);
+        assert!(report.checks.classification_valid);
+        assert!(report.checks.software_chain_valid);
+        assert!(report.checks.counts_valid);
+    }
+
+    #[test]
+    fn scoped_runtime_event_workload_id_is_required() {
+        let policy = base_policy();
+        let mut event = runtime_event("/usr/bin/echo");
+        event.workload_id = None;
+        let (events, summary) = evidence_fixture(&policy, vec![event]);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.workload_identity_valid);
+        assert!(report.reason.contains(
+            "runtime event workload_id mismatch at seq_no 4: expected workload-a got <missing>"
+        ));
+        assert!(report.checks.event_hashes_valid);
+        assert!(report.checks.classification_valid);
+        assert!(report.checks.software_chain_valid);
+        assert!(report.checks.counts_valid);
+    }
+
+    #[test]
+    fn host_wide_runtime_event_workload_id_is_tolerated() {
+        let policy = base_policy();
+        let mut missing_workload_event = runtime_event("/usr/bin/echo");
+        missing_workload_event.workload_id = None;
+        let mut different_workload_event = runtime_event("/usr/bin/echo");
+        different_workload_event.workload_id = Some(String::from("other"));
+        let (events, mut summary) = evidence_fixture(
+            &policy,
+            vec![missing_workload_event, different_workload_event],
+        );
+        summary.collection_mode = String::from("host-wide");
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert_eq!(report.counts.acceptable, 2);
+        assert!(report.checks.workload_identity_valid);
+        assert!(report.checks.event_hashes_valid);
+        assert!(report.checks.classification_valid);
+        assert!(report.checks.software_chain_valid);
+        assert!(report.checks.counts_valid);
+    }
+
+    #[test]
+    fn unknown_collection_mode_is_invalid_for_workload_identity() {
+        let policy = base_policy();
+        let (events, mut summary) = evidence_fixture(&policy, Vec::new());
+        summary.collection_mode = String::from("scpoed");
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.workload_identity_valid);
+        assert!(
+            report
+                .reason
+                .contains("unknown collection_mode for workload identity check: scpoed")
+        );
+        assert_eq!(report.counts.acceptable, 0);
+        assert!(report.checks.event_hashes_valid);
+        assert!(report.checks.classification_valid);
+        assert!(report.checks.software_chain_valid);
+        assert!(report.checks.counts_valid);
     }
 
     #[test]
@@ -2720,6 +2896,42 @@ mod tests {
         assert_eq!(report.decision, VerificationDecision::Accept);
         assert_eq!(report.counts.acceptable, 1);
         assert!(report.checks.classification_valid);
+    }
+
+    #[test]
+    fn incomplete_argv_sensitive_evidence_replays_as_suspicious() {
+        let mut policy = base_policy();
+        policy.acceptable.exec_paths.clear();
+        policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
+        policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
+            exe_path: String::from("/usr/local/bin/python"),
+            argv: vec![
+                String::from("python"),
+                String::from("-m"),
+                String::from("uvicorn"),
+                String::from("app:app"),
+            ],
+            match_type: InvocationMatchType::Exact,
+        }];
+        let mut event = exec_attempt_event(
+            "/usr/local/bin/python",
+            vec!["python", "-m", "uvicorn", "app:app"],
+        );
+        event.argv_complete = false;
+        let (events, summary) = evidence_fixture(&policy, vec![event]);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::AcceptWithWarnings);
+        assert_eq!(report.counts.suspicious, 1);
+        assert!(report.checks.classification_valid);
+        assert_eq!(
+            report
+                .first_suspicious_event
+                .as_ref()
+                .map(|event| event.rule_id.as_str()),
+            Some("argv-sensitive-incomplete-evidence")
+        );
     }
 
     #[test]
