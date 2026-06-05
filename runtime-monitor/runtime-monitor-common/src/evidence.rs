@@ -25,11 +25,11 @@ fn default_profile_mode() -> String {
 }
 
 fn default_attestation_backend() -> String {
-    String::from("none")
+    String::from("software-chain")
 }
 
 fn default_attestation_mode() -> String {
-    String::from("software-chain")
+    String::new()
 }
 
 fn default_fail_on_denied() -> bool {
@@ -1805,8 +1805,8 @@ mod tests {
                 "comm_names": []
             },
             "attestation": {
-                "backend": "none",
-                "mode": "software-chain"
+                "backend": "software-chain",
+                "mode": ""
             }
         }"#;
 
@@ -1814,6 +1814,15 @@ mod tests {
 
         assert!(policy.acceptable.argv_sensitive_exec_paths.is_empty());
         assert!(policy.acceptable.allowed_invocations.is_empty());
+    }
+
+    #[test]
+    fn default_attestation_policy_uses_software_chain_backend_and_empty_mode() {
+        let policy = AttestationPolicy::default();
+
+        assert_eq!(policy.backend, "software-chain");
+        assert_eq!(policy.mode, "");
+        assert!(policy.extend_on.is_empty());
     }
 
     #[test]

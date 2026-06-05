@@ -13,8 +13,7 @@ use runtime_monitor_common::{
     session_start_digest, synthetic_record_hash,
 };
 
-const SUPPORTED_ATTESTATION_MODES: &[&str] =
-    &["software-chain", "final-summary", "policy-triggered"];
+const SUPPORTED_TPM_ATTESTATION_MODES: &[&str] = &["final-summary", "policy-triggered"];
 
 #[derive(Debug)]
 struct Args {
@@ -1424,19 +1423,34 @@ fn tpm_event_policy(
     let mode = policy.attestation.mode.trim().to_ascii_lowercase();
     let mut extend_on = Vec::new();
 
-    if backend != "none" && backend != "tpm" {
+    if backend == "none" {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(String::from(
+            "attestation.backend none is no longer supported; use software-chain for software-only evidence",
+        ));
+    } else if backend != "software-chain" && backend != "tpm" {
         checks.tpm_metadata_valid = false;
         structural_reasons.push(format!(
-            "unsupported attestation.backend `{}`; expected `none` or `tpm`",
+            "unsupported attestation.backend `{}`; expected `software-chain` or `tpm`",
             policy.attestation.backend
         ));
     }
-    if !SUPPORTED_ATTESTATION_MODES.contains(&mode.as_str()) {
+
+    if mode == "software-chain" {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(String::from(
+            "attestation.mode software-chain is no longer supported; use attestation.backend software-chain with empty mode for software-only evidence",
+        ));
+    } else if backend == "software-chain" && !mode.is_empty() {
+        checks.tpm_metadata_valid = false;
+        structural_reasons.push(String::from(
+            "attestation.backend software-chain must not set attestation.mode",
+        ));
+    } else if backend_is_tpm && !SUPPORTED_TPM_ATTESTATION_MODES.contains(&mode.as_str()) {
         checks.tpm_metadata_valid = false;
         structural_reasons.push(format!(
-            "unsupported attestation.mode `{}`; expected one of {}",
-            policy.attestation.mode,
-            SUPPORTED_ATTESTATION_MODES.join(", ")
+            "attestation.backend tpm requires attestation.mode to be one of {}",
+            SUPPORTED_TPM_ATTESTATION_MODES.join(", ")
         ));
     }
 
@@ -2467,6 +2481,76 @@ mod tests {
     }
 
     #[test]
+    fn software_chain_backend_with_empty_mode_is_valid_software_evidence() {
+        let policy = base_policy();
+        let (events, summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert!(report.checks.tpm_metadata_valid);
+        assert_eq!(policy.attestation.backend, "software-chain");
+        assert_eq!(policy.attestation.mode, "");
+    }
+
+    #[test]
+    fn backend_none_is_invalid_evidence() {
+        let mut policy = base_policy();
+        policy.attestation.backend = String::from("none");
+        let (events, summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("none is no longer supported"));
+    }
+
+    #[test]
+    fn software_chain_backend_rejects_non_empty_attestation_mode() {
+        for mode in ["software-chain", "final-summary", "policy-triggered"] {
+            let mut policy = base_policy();
+            policy.attestation.mode = String::from(mode);
+            let (events, summary) = evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+
+            let report = verify_fixture(&policy, &events, &summary);
+
+            assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+            assert!(!report.checks.tpm_metadata_valid);
+            if mode == "software-chain" {
+                assert!(report.reason.contains("no longer supported"));
+            } else {
+                assert!(
+                    report
+                        .reason
+                        .contains("backend software-chain must not set")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn tpm_backend_rejects_empty_or_software_chain_mode() {
+        for mode in ["", "software-chain"] {
+            let mut policy = tpm_policy(Some(true));
+            policy.attestation.mode = String::from(mode);
+            let (events, mut summary) =
+                evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo")]);
+            attach_valid_tpm_summary(&policy, &mut summary);
+
+            let report = verify_fixture(&policy, &events, &summary);
+
+            assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+            assert!(!report.checks.tpm_metadata_valid);
+            if mode == "software-chain" {
+                assert!(report.reason.contains("no longer supported"));
+            } else {
+                assert!(report.reason.contains("backend tpm requires"));
+            }
+        }
+    }
+
+    #[test]
     fn final_summary_mode_with_empty_extend_on_accepts_valid_tpm_summary() {
         let mut policy = tpm_policy(Some(true));
         policy.attestation.extend_on.clear();
@@ -2508,6 +2592,31 @@ mod tests {
         assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
         assert!(!report.checks.tpm_metadata_valid);
         assert!(report.reason.contains("extend_on"));
+    }
+
+    #[test]
+    fn unsupported_or_duplicate_extend_on_values_are_invalid_evidence() {
+        let unknown = policy_triggered_tpm_policy(vec!["critical"], Some(true));
+        let (events, mut summary) =
+            evidence_fixture(&unknown, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&unknown, &mut summary);
+
+        let report = verify_fixture(&unknown, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("attestation.extend_on"));
+
+        let duplicate = policy_triggered_tpm_policy(vec!["denied", "denied"], Some(true));
+        let (events, mut summary) =
+            evidence_fixture(&duplicate, vec![runtime_event("/usr/bin/echo")]);
+        attach_valid_tpm_summary(&duplicate, &mut summary);
+
+        let report = verify_fixture(&duplicate, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::InvalidEvidence);
+        assert!(!report.checks.tpm_metadata_valid);
+        assert!(report.reason.contains("duplicate attestation.extend_on"));
     }
 
     #[test]

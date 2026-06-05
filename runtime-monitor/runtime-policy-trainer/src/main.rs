@@ -1472,8 +1472,8 @@ mod tests {
         assert!(!output.policy.attestation.fail_on_suspicious);
         assert!(output.policy.attestation.fail_on_denied);
         assert!(output.policy.attestation.fail_on_drops);
-        assert_eq!(output.policy.attestation.backend, "none");
-        assert_eq!(output.policy.attestation.mode, "software-chain");
+        assert_eq!(output.policy.attestation.backend, "software-chain");
+        assert_eq!(output.policy.attestation.mode, "");
     }
 
     #[test]

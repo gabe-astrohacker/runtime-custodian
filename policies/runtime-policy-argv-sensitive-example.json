@@ -31,8 +31,8 @@
     "comm_names": []
   },
   "attestation": {
-    "backend": "none",
-    "mode": "software-chain",
+    "backend": "software-chain",
+    "mode": "",
     "fail_on_suspicious": false,
     "fail_on_denied": true,
     "fail_on_drops": true

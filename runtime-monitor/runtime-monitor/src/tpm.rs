@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 use runtime_monitor_common::{AttestationPolicy, EventClassification};
 
 const SUPPORTED_HASH_BANK: &str = "sha256";
-const SUPPORTED_MODES: &[&str] = &["software-chain", "final-summary", "policy-triggered"];
+const SUPPORTED_TPM_MODES: &[&str] = &["final-summary", "policy-triggered"];
 const MAX_PCR_INDEX: u32 = 23;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -75,13 +75,13 @@ impl TpmConfig {
         local: TpmLocalOptions,
     ) -> Result<Self> {
         let backend = normalize_field(&policy.backend, "attestation.backend")?;
-        let mode = validate_mode(&policy.mode)?;
+        let mode = validate_mode(&policy.mode, &backend)?;
         let extend_on = validate_extend_on(&policy.extend_on, &backend, &mode)?;
         let tcti = normalize_optional_local_string(local.tcti);
         let reset_pcr = local.reset_pcr;
 
         match backend.as_str() {
-            "none" => Ok(Self {
+            "software-chain" => Ok(Self {
                 enabled: false,
                 tcti,
                 mode,
@@ -110,7 +110,7 @@ impl TpmConfig {
                 })
             }
             _ => Err(anyhow!(
-                "unsupported attestation.backend `{}`; expected `none` or `tpm`",
+                "unsupported attestation.backend `{}`; expected `software-chain` or `tpm`",
                 policy.backend
             )),
         }
@@ -277,15 +277,40 @@ fn parse_pcr_read_output(stdout: &[u8], pcr: u32) -> Result<String> {
     Err(anyhow!("tpm2_pcrread output did not contain PCR {pcr}"))
 }
 
-fn validate_mode(mode: &str) -> Result<String> {
-    let mode = normalize_field(mode, "attestation.mode")?;
-    if SUPPORTED_MODES.contains(&mode.as_str()) {
-        return Ok(mode);
+fn validate_mode(mode: &str, backend: &str) -> Result<String> {
+    let mode = mode.trim().to_ascii_lowercase();
+
+    if mode == "software-chain" {
+        return Err(anyhow!(
+            "attestation.mode software-chain is no longer supported; use attestation.backend software-chain with empty mode for software-only evidence"
+        ));
     }
-    Err(anyhow!(
-        "unsupported attestation.mode `{mode}`; expected one of {}",
-        SUPPORTED_MODES.join(", ")
-    ))
+
+    match backend {
+        "none" => Err(anyhow!(
+            "attestation.backend none is no longer supported; use software-chain for software-only evidence"
+        )),
+        "software-chain" => {
+            if mode.is_empty() {
+                Ok(mode)
+            } else {
+                Err(anyhow!(
+                    "attestation.backend software-chain must not set attestation.mode"
+                ))
+            }
+        }
+        "tpm" => {
+            if SUPPORTED_TPM_MODES.contains(&mode.as_str()) {
+                Ok(mode)
+            } else {
+                Err(anyhow!(
+                    "attestation.backend tpm requires attestation.mode to be one of {}",
+                    SUPPORTED_TPM_MODES.join(", ")
+                ))
+            }
+        }
+        _ => Ok(mode),
+    }
 }
 
 fn validate_extend_on(
@@ -450,6 +475,7 @@ mod tests {
     fn tpm_policy() -> AttestationPolicy {
         AttestationPolicy {
             backend: String::from("tpm"),
+            mode: String::from("final-summary"),
             runtime_pcr: Some(23),
             hash_bank: Some(String::from("sha256")),
             ..AttestationPolicy::default()
@@ -466,7 +492,7 @@ mod tests {
     }
 
     #[test]
-    fn backend_none_disables_tpm_without_runtime_pcr() {
+    fn backend_software_chain_disables_tpm_without_runtime_pcr() {
         let config = TpmConfig::from_policy_and_local_options(
             &AttestationPolicy::default(),
             TpmLocalOptions::default(),
@@ -475,7 +501,7 @@ mod tests {
 
         assert!(!config.enabled);
         assert_eq!(config.runtime_pcr, None);
-        assert_eq!(config.mode, "software-chain");
+        assert_eq!(config.mode, "");
         assert_eq!(config.hash_bank, "sha256");
         assert!(config.extend_on.is_empty());
     }
@@ -486,7 +512,7 @@ mod tests {
 
         assert!(config.enabled);
         assert_eq!(config.runtime_pcr, Some(23));
-        assert_eq!(config.mode, "software-chain");
+        assert_eq!(config.mode, "final-summary");
         assert_eq!(config.hash_bank, "sha256");
         assert!(config.extend_on.is_empty());
         assert!(config.fail_on_tpm_error);
@@ -494,7 +520,7 @@ mod tests {
 
     #[test]
     fn known_attestation_modes_are_accepted_for_tpm_backend() {
-        for mode in SUPPORTED_MODES {
+        for mode in SUPPORTED_TPM_MODES {
             let mut policy = tpm_policy();
             policy.mode = (*mode).to_owned();
             if *mode == "policy-triggered" {
@@ -506,6 +532,67 @@ mod tests {
                     .expect("known mode");
 
             assert!(config.enabled);
+        }
+    }
+
+    #[test]
+    fn default_attestation_policy_uses_software_chain_backend_and_empty_mode() {
+        let policy = AttestationPolicy::default();
+
+        assert_eq!(policy.backend, "software-chain");
+        assert_eq!(policy.mode, "");
+        assert!(policy.extend_on.is_empty());
+    }
+
+    #[test]
+    fn backend_none_is_rejected() {
+        let policy = AttestationPolicy {
+            backend: String::from("none"),
+            ..AttestationPolicy::default()
+        };
+
+        let error = TpmConfig::from_policy_and_local_options(&policy, TpmLocalOptions::default())
+            .expect_err("backend none should fail");
+
+        assert!(error.to_string().contains("none is no longer supported"));
+    }
+
+    #[test]
+    fn software_chain_backend_rejects_non_empty_mode() {
+        for mode in ["software-chain", "final-summary", "policy-triggered"] {
+            let policy = AttestationPolicy {
+                backend: String::from("software-chain"),
+                mode: String::from(mode),
+                ..AttestationPolicy::default()
+            };
+
+            let error =
+                TpmConfig::from_policy_and_local_options(&policy, TpmLocalOptions::default())
+                    .expect_err("software-chain backend with mode should fail");
+
+            if mode == "software-chain" {
+                assert!(error.to_string().contains("no longer supported"));
+            } else {
+                assert!(error.to_string().contains("must not set"));
+            }
+        }
+    }
+
+    #[test]
+    fn tpm_backend_rejects_empty_or_software_chain_mode() {
+        for mode in ["", "software-chain"] {
+            let mut policy = tpm_policy();
+            policy.mode = String::from(mode);
+
+            let error =
+                TpmConfig::from_policy_and_local_options(&policy, TpmLocalOptions::default())
+                    .expect_err("tpm backend mode should fail");
+
+            if mode == "software-chain" {
+                assert!(error.to_string().contains("no longer supported"));
+            } else {
+                assert!(error.to_string().contains("requires attestation.mode"));
+            }
         }
     }
 
@@ -577,7 +664,7 @@ mod tests {
             mode: String::from("policy-triggered"),
             ..AttestationPolicy::default()
         };
-        disabled_policy.backend = String::from("none");
+        disabled_policy.backend = String::from("software-chain");
 
         let error =
             TpmConfig::from_policy_and_local_options(&disabled_policy, TpmLocalOptions::default())
