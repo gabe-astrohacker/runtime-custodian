@@ -145,6 +145,10 @@ impl RuntimeEventType {
         matches!(self, Self::Exec)
     }
 
+    pub fn is_exec_like(self) -> bool {
+        matches!(self, Self::Exec | Self::ExecAttempt)
+    }
+
     pub fn policy_name(self) -> String {
         match self {
             Self::Fork => String::from("fork"),
@@ -831,10 +835,10 @@ pub fn classify_event(event: &RuntimeEvent, policy: &RuntimePolicy) -> Classific
         return result;
     }
 
-    // For exec events, an executable path must be explicitly acceptable when
-    // `unknown_exec_path` is enabled. Listing "exec" in acceptable.event_types
-    // must not accidentally approve all executable paths.
-    if event.event_type.is_exec() {
+    // Exec-like events are security-relevant process execution signals. They
+    // must be accepted by executable path or argv-sensitive invocation policy;
+    // event-type allowlisting alone must not bless arbitrary exec attempts.
+    if event.event_type.is_exec_like() {
         if let Some(reason) = acceptable_by_exec_path(event, policy) {
             return ClassificationResult {
                 classification: EventClassification::Acceptable,
@@ -851,7 +855,9 @@ pub fn classify_event(event: &RuntimeEvent, policy: &RuntimePolicy) -> Classific
             };
         }
 
-        if let Some(reason) = acceptable_by_event_type(event, policy) {
+        if event.event_type.is_exec()
+            && let Some(reason) = acceptable_by_event_type(event, policy)
+        {
             return ClassificationResult {
                 classification: EventClassification::Acceptable,
                 rule_id: String::from("acceptable-event-type"),
@@ -1734,14 +1740,15 @@ mod tests {
         let result = classify_event(&event, &policy);
 
         assert_eq!(result.classification, EventClassification::Suspicious);
-        assert_eq!(result.rule_id, "default-suspicious");
+        assert_eq!(result.rule_id, "unknown-exec-path");
     }
 
     #[test]
-    fn exec_attempt_can_be_acceptable_when_explicitly_listed() {
+    fn exec_attempt_is_not_approved_by_exec_attempt_event_type() {
         let mut policy = sample_policy();
         policy.acceptable.exec_paths.clear();
         policy.acceptable.event_types = Vec::from([String::from("exec-attempt")]);
+        policy.suspicious.unknown_exec_path = true;
 
         let mut event = sample_event();
         event.event_type = RuntimeEventType::ExecAttempt;
@@ -1749,8 +1756,36 @@ mod tests {
 
         let result = classify_event(&event, &policy);
 
+        assert_eq!(result.classification, EventClassification::Suspicious);
+        assert_eq!(result.rule_id, "unknown-exec-path");
+    }
+
+    #[test]
+    fn exec_attempt_can_be_acceptable_by_exec_path() {
+        let policy = sample_policy();
+        let mut event = sample_event();
+        event.event_type = RuntimeEventType::ExecAttempt;
+
+        let result = classify_event(&event, &policy);
+
         assert_eq!(result.classification, EventClassification::Acceptable);
-        assert_eq!(result.rule_id, "acceptable-event-type");
+        assert_eq!(result.rule_id, "acceptable-exec-path");
+    }
+
+    #[test]
+    fn denied_exec_attempt_path_overrides_acceptable_event_type() {
+        let mut policy = sample_policy();
+        policy.acceptable.exec_paths.clear();
+        policy.acceptable.event_types = Vec::from([String::from("exec-attempt")]);
+
+        let mut event = sample_event();
+        event.event_type = RuntimeEventType::ExecAttempt;
+        event.exe_path = String::from("/bin/sh");
+
+        let result = classify_event(&event, &policy);
+
+        assert_eq!(result.classification, EventClassification::Denied);
+        assert_eq!(result.rule_id, "deny-exec-path");
     }
 
     #[test]
@@ -1895,7 +1930,7 @@ mod tests {
         let result = classify_event(&event, &policy);
 
         assert_eq!(result.classification, EventClassification::Suspicious);
-        assert_eq!(result.rule_id, "default-suspicious");
+        assert_eq!(result.rule_id, "unknown-exec-path");
     }
 
     #[test]

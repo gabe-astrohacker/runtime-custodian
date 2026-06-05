@@ -2851,7 +2851,7 @@ mod tests {
     }
 
     #[test]
-    fn exec_attempt_is_acceptable_when_explicitly_listed() {
+    fn exec_attempt_is_replayed_as_suspicious_when_only_exec_attempt_event_type_is_acceptable() {
         let mut policy = base_policy();
         policy.acceptable.exec_paths.clear();
         policy.acceptable.event_types = vec![String::from("exec-attempt")];
@@ -2862,8 +2862,15 @@ mod tests {
 
         let report = verify_fixture(&policy, &events, &summary);
 
-        assert_eq!(report.decision, VerificationDecision::Accept);
-        assert_eq!(report.counts.acceptable, 1);
+        assert_eq!(report.decision, VerificationDecision::AcceptWithWarnings);
+        assert_eq!(report.counts.suspicious, 1);
+        assert_eq!(
+            report
+                .first_suspicious_event
+                .as_ref()
+                .map(|event| event.seq_no),
+            Some(4)
+        );
         assert!(report.checks.event_hashes_valid);
         assert!(report.checks.classification_valid);
     }
