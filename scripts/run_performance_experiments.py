@@ -18,9 +18,10 @@ import argparse
 import collections
 import csv
 import json
-import platform
+import os
 import signal
 import statistics
+import subprocess
 import sys
 import time
 from dataclasses import dataclass
@@ -32,9 +33,19 @@ from integration_lib import (
     IntegrationFailure,
     RuntimeHarness,
     Settings,
+    assert_release_binaries,
+    bootstrap_ci,
+    environment_metadata,
     fail,
+    iter_evidence_records,
     iter_runtime_evidence_events,
     log,
+    overhead_ci,
+    overhead_pct_inf,
+    percentile_nearest_rank,
+    read_json,
+    safe_filename,
+    summary_stats,
 )
 
 
@@ -46,6 +57,7 @@ class PerformanceConfig:
     requests: int
     warmup_requests: int
     trials: int
+    cooldown_secs: float
     collection_mode: str
     expected_evidence: tuple[str, ...]
     output_dir: Path
@@ -54,6 +66,10 @@ class PerformanceConfig:
     event_duration_secs: float
     event_requests: int
     top_exec_paths: int
+    host_noise: bool
+    host_noise_command: str
+    host_noise_interval_ms: int
+    host_noise_workers: int
 
 
 def parse_args() -> argparse.Namespace:
@@ -105,6 +121,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="skip scripts/build_all.sh",
     )
+    parser.add_argument(
+        "--allow-debug",
+        action="store_true",
+        help="allow measuring debug (non-release) binaries; sets ALLOW_DEBUG_BINARIES=1 (development only)",
+    )
+    parser.add_argument(
+        "--cooldown-secs",
+        type=float,
+        default=1.0,
+        help="seconds to sleep between latency trials to let the host settle",
+    )
 
     event_group = parser.add_argument_group("event-volume experiment")
     event_group.add_argument(
@@ -125,6 +152,28 @@ def parse_args() -> argparse.Namespace:
         default=10,
         help="number of top executable paths to include in event-volume output",
     )
+    event_group.add_argument(
+        "--host-noise",
+        action="store_true",
+        help="run unrelated host exec noise during each event-volume capture",
+    )
+    event_group.add_argument(
+        "--host-noise-command",
+        default="/usr/bin/id >/dev/null 2>&1",
+        help="shell command repeatedly executed as unrelated host noise",
+    )
+    event_group.add_argument(
+        "--host-noise-interval-ms",
+        type=int,
+        default=50,
+        help="delay between host-noise command executions per worker",
+    )
+    event_group.add_argument(
+        "--host-noise-workers",
+        type=int,
+        default=1,
+        help="number of independent host-noise loops to run",
+    )
 
     return parser.parse_args()
 
@@ -141,6 +190,11 @@ class PerformanceExperimentRunner(RuntimeHarness):
 
             if self.should_build:
                 self.build()
+
+            # Refuse to measure debug builds (override via --allow-debug /
+            # ALLOW_DEBUG_BINARIES=1); the chosen build mode is always recorded
+            # in result["environment"] regardless.
+            assert_release_binaries(self.settings)
 
             self.config.output_dir.mkdir(parents=True, exist_ok=True)
             self.workload.start()
@@ -194,7 +248,10 @@ class PerformanceExperimentRunner(RuntimeHarness):
             "requested_experiment": self.config.experiment,
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             "endpoint": self.config.endpoint,
-            "environment": environment_metadata(self.settings),
+            "environment": {
+                **environment_metadata(self.settings),
+                "base_url": self.settings.base_url,
+            },
         }
 
         if self.config.experiment in ("latency", "both"):
@@ -209,44 +266,63 @@ class PerformanceExperimentRunner(RuntimeHarness):
         trial_results: list[dict[str, Any]] = []
 
         for trial in range(1, self.config.trials + 1):
-            log(f"== latency trial {trial}/{self.config.trials}: baseline ==")
-            baseline = self.measure_http_latency(
-                endpoint=self.config.endpoint,
-                requests=self.config.requests,
-                warmup_requests=self.config.warmup_requests,
+            # Counterbalance the phase order across trials so monotonic host
+            # drift (thermal throttling, page-cache warming) does not load
+            # systematically onto the monitored phase. Odd trials run
+            # baseline-first, even trials monitored-first.
+            baseline_first = trial % 2 == 1
+            phase_order = (
+                ["baseline", "monitored"] if baseline_first else ["monitored", "baseline"]
             )
 
-            log(f"== latency trial {trial}/{self.config.trials}: monitored ==")
             monitored_paths = self.case_paths(
                 f"{self.config.name}_latency_trial_{trial}",
                 log_dir=self.config.output_dir,
             )
-            self.clean_case(monitored_paths)
-            self.write_case_collector_config(
-                monitored_paths,
-                overrides={"collection_mode": self.config.collection_mode},
-            )
+            measured: dict[str, dict[str, Any]] = {}
 
-            started_at = self.monitor.start(monitored_paths)
-            try:
-                monitored = self.measure_http_latency(
+            def run_baseline() -> None:
+                log(f"== latency trial {trial}/{self.config.trials}: baseline ==")
+                measured["baseline"] = self.measure_http_latency(
                     endpoint=self.config.endpoint,
                     requests=self.config.requests,
                     warmup_requests=self.config.warmup_requests,
                 )
-            finally:
-                self.monitor.stop()
 
-            if self.config.verify_evidence:
-                self.assert_fresh_evidence(monitored_paths, started_at)
-                for expected in self.config.expected_evidence:
-                    self.assert_evidence_contains(monitored_paths, expected)
+            def run_monitored() -> None:
+                log(f"== latency trial {trial}/{self.config.trials}: monitored ==")
+                self.clean_case(monitored_paths)
+                self.write_case_collector_config(
+                    monitored_paths,
+                    overrides={"collection_mode": self.config.collection_mode},
+                )
+                started_at = self.monitor.start(monitored_paths)
+                try:
+                    measured["monitored"] = self.measure_http_latency(
+                        endpoint=self.config.endpoint,
+                        requests=self.config.requests,
+                        warmup_requests=self.config.warmup_requests,
+                    )
+                finally:
+                    self.monitor.stop()
 
+                if self.config.verify_evidence:
+                    self.assert_fresh_evidence(monitored_paths, started_at)
+                    for expected in self.config.expected_evidence:
+                        self.assert_evidence_contains(monitored_paths, expected)
+
+            actions = {"baseline": run_baseline, "monitored": run_monitored}
+            for phase in phase_order:
+                actions[phase]()
+
+            baseline = measured["baseline"]
+            monitored = measured["monitored"]
             overhead = overhead_percentages(baseline, monitored)
-            summary = read_json_file(monitored_paths.summary)
+            summary = read_json(monitored_paths.summary)
 
             log(
-                f"trial={trial} median baseline={baseline['median_ms']:.3f}ms "
+                f"trial={trial} order={'/'.join(phase_order)} "
+                f"median baseline={baseline['median_ms']:.3f}ms "
                 f"monitored={monitored['median_ms']:.3f}ms "
                 f"overhead={overhead['median_ms']:.2f}%"
             )
@@ -254,6 +330,7 @@ class PerformanceExperimentRunner(RuntimeHarness):
             trial_results.append(
                 {
                     "trial": trial,
+                    "phase_order": phase_order,
                     "baseline": baseline,
                     "monitored": monitored,
                     "overhead_pct": overhead,
@@ -265,6 +342,11 @@ class PerformanceExperimentRunner(RuntimeHarness):
                     "monitor_summary": summary,
                 }
             )
+
+            # Let the host settle between trials so back-to-back runs do not
+            # bleed thermal/scheduler state into the next trial.
+            if trial < self.config.trials and self.config.cooldown_secs > 0:
+                time.sleep(self.config.cooldown_secs)
 
         return {
             "endpoint": self.config.endpoint,
@@ -282,6 +364,10 @@ class PerformanceExperimentRunner(RuntimeHarness):
             fail("--event-requests must be >= 0")
         if self.config.event_duration_secs < 0:
             fail("--event-duration-secs must be >= 0")
+        if self.config.host_noise_interval_ms < 0:
+            fail("--host-noise-interval-ms must be >= 0")
+        if self.config.host_noise_workers < 1:
+            fail("--host-noise-workers must be >= 1")
 
         captures: dict[str, dict[str, Any]] = {}
 
@@ -298,13 +384,20 @@ class PerformanceExperimentRunner(RuntimeHarness):
 
             started_at = self.monitor.start(paths)
             capture_deadline = time.monotonic() + self.config.event_duration_secs
+            host_noise = HostNoiseController(
+                enabled=self.config.host_noise,
+                command=self.config.host_noise_command,
+                interval_ms=self.config.host_noise_interval_ms,
+                workers=self.config.host_noise_workers,
+            )
             try:
-                for _ in range(self.config.event_requests):
-                    self.workload.get(self.config.endpoint)
+                with host_noise:
+                    for _ in range(self.config.event_requests):
+                        self.workload.get(self.config.endpoint)
 
-                remaining = capture_deadline - time.monotonic()
-                if remaining > 0:
-                    time.sleep(remaining)
+                    remaining = capture_deadline - time.monotonic()
+                    if remaining > 0:
+                        time.sleep(remaining)
             finally:
                 self.monitor.stop()
 
@@ -327,6 +420,12 @@ class PerformanceExperimentRunner(RuntimeHarness):
             "event_requests": self.config.event_requests,
             "event_duration_secs": self.config.event_duration_secs,
             "top_exec_paths": self.config.top_exec_paths,
+            "host_noise": {
+                "enabled": self.config.host_noise,
+                "command": self.config.host_noise_command,
+                "interval_ms": self.config.host_noise_interval_ms,
+                "workers": self.config.host_noise_workers,
+            },
             "captures": captures,
             "reduction": reduction,
         }
@@ -355,11 +454,15 @@ class PerformanceExperimentRunner(RuntimeHarness):
             elapsed_ns = time.perf_counter_ns() - start_ns
             latencies_ms.append(elapsed_ns / 1_000_000)
 
-        return summarise_latencies(latencies_ms)
+        phase = summarise_latencies(latencies_ms)
+        # Preserve the raw per-request samples so distributions can be
+        # re-plotted downstream rather than only the summary statistics.
+        phase["latencies_ms"] = latencies_ms
+        return phase
 
     def write_results(self, result: dict[str, Any]) -> tuple[Path, list[Path]]:
         stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        safe_name = safe_filename(self.config.name)
+        safe_name = safe_filename(self.config.name, "runtime_perf")
 
         json_path = self.config.output_dir / f"{safe_name}_{stamp}.json"
         json_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
@@ -391,59 +494,83 @@ def summarise_latencies(latencies_ms: list[float]) -> dict[str, float | int]:
         "mean_ms": statistics.fmean(ordered),
         "median_ms": statistics.median(ordered),
         "p95_ms": percentile_nearest_rank(ordered, 95),
+        "p99_ms": percentile_nearest_rank(ordered, 99),
         "min_ms": ordered[0],
         "max_ms": ordered[-1],
         "throughput_rps": 1000.0 / (total / count),
     }
 
 
-def percentile_nearest_rank(ordered_values: list[float], percentile: float) -> float:
-    if not ordered_values:
-        fail("cannot compute percentile of empty list")
-
-    if len(ordered_values) == 1:
-        return ordered_values[0]
-
-    index = int(round((percentile / 100.0) * (len(ordered_values) - 1)))
-    index = max(0, min(index, len(ordered_values) - 1))
-    return ordered_values[index]
-
-
 def overhead_percentages(
     baseline: dict[str, float | int],
     monitored: dict[str, float | int],
 ) -> dict[str, float]:
-    metrics = ["mean_ms", "median_ms", "p95_ms", "min_ms", "max_ms"]
-    return {metric: overhead_pct(float(baseline[metric]), float(monitored[metric])) for metric in metrics}
-
-
-def overhead_pct(baseline: float, monitored: float) -> float:
-    if baseline == 0:
-        return float("inf")
-    return ((monitored / baseline) - 1.0) * 100.0
+    metrics = ["mean_ms", "median_ms", "p95_ms", "p99_ms", "min_ms", "max_ms"]
+    return {metric: overhead_pct_inf(float(baseline[metric]), float(monitored[metric])) for metric in metrics}
 
 
 def aggregate_latency_trial_results(trials: list[dict[str, Any]]) -> dict[str, Any]:
     if not trials:
         fail("cannot aggregate zero latency trials")
 
-    metrics = ["mean_ms", "median_ms", "p95_ms", "min_ms", "max_ms", "throughput_rps"]
+    metrics = ["mean_ms", "median_ms", "p95_ms", "p99_ms", "min_ms", "max_ms", "throughput_rps"]
 
-    def mean_for(phase: str, metric: str) -> float:
-        return statistics.fmean(float(trial[phase][metric]) for trial in trials)
+    def values_for(phase: str, metric: str) -> list[float]:
+        return [float(trial[phase][metric]) for trial in trials]
 
-    baseline = {metric: mean_for("baseline", metric) for metric in metrics}
-    monitored = {metric: mean_for("monitored", metric) for metric in metrics}
-    overhead = overhead_percentages(baseline, monitored)
+    def phase_aggregate(phase: str) -> dict[str, Any]:
+        agg: dict[str, Any] = {}
+        for metric in metrics:
+            stats = summary_stats(values_for(phase, metric))
+            # Report the across-trial mean with its dispersion alongside, so no
+            # central-tendency number is presented without its spread.
+            agg[metric] = stats["mean"]
+            agg[f"{metric}_stdev"] = stats["stdev"]
+            agg[f"{metric}_cov"] = stats["cov"]
+        return agg
+
+    baseline = phase_aggregate("baseline")
+    monitored = phase_aggregate("monitored")
+    overhead = overhead_percentages(
+        {metric: baseline[metric] for metric in metrics},
+        {metric: monitored[metric] for metric in metrics},
+    )
+
+    # Bootstrap confidence intervals for the headline median latency and its
+    # overhead, pooling the raw per-request samples across trials per phase so
+    # the overhead is reported with an uncertainty interval rather than as a
+    # bare point estimate. Falls back to per-trial medians if raw samples are
+    # unavailable (older evidence without preserved latencies).
+    baseline_samples: list[float] = []
+    monitored_samples: list[float] = []
+    for trial in trials:
+        baseline_samples.extend(float(x) for x in trial["baseline"].get("latencies_ms", []))
+        monitored_samples.extend(float(x) for x in trial["monitored"].get("latencies_ms", []))
+    if not (baseline_samples and monitored_samples):
+        baseline_samples = values_for("baseline", "median_ms")
+        monitored_samples = values_for("monitored", "median_ms")
 
     return {
         "baseline": baseline,
         "monitored": monitored,
         "overhead_pct": overhead,
+        "overhead_median_pct_ci": overhead_ci(
+            baseline_samples, monitored_samples, statistic=statistics.median
+        ),
+        "baseline_median_ms_ci": bootstrap_ci(baseline_samples, statistic=statistics.median),
+        "monitored_median_ms_ci": bootstrap_ci(monitored_samples, statistic=statistics.median),
     }
 
 
 def summarise_evidence(paths: Any, *, top_n: int) -> dict[str, Any]:
+    total_record_count = 0
+    synthetic_record_count = 0
+
+    for parsed in iter_evidence_records(paths.evidence):
+        total_record_count += 1
+        if parsed.data.get("record_kind") == "synthetic":
+            synthetic_record_count += 1
+
     event_count = 0
     event_type_counts: collections.Counter[str] = collections.Counter()
     workload_counts: collections.Counter[str] = collections.Counter()
@@ -464,7 +591,10 @@ def summarise_evidence(paths: Any, *, top_n: int) -> dict[str, Any]:
             classification_counts[str(classification)] += 1
 
     return {
+        "total_record_count": total_record_count,
+        "synthetic_record_count": synthetic_record_count,
         "event_count": event_count,
+        "evidence_size_bytes": paths.evidence.stat().st_size if paths.evidence.exists() else 0,
         "event_type_counts": dict(event_type_counts.most_common()),
         "workload_counts": dict(workload_counts.most_common()),
         "classification_counts": dict(classification_counts.most_common()),
@@ -475,8 +605,57 @@ def summarise_evidence(paths: Any, *, top_n: int) -> dict[str, Any]:
         "evidence": str(paths.evidence),
         "summary": str(paths.summary),
         "monitor_log": str(paths.monitor_log),
-        "monitor_summary": read_json_file(paths.summary),
+        "monitor_summary": read_json(paths.summary),
     }
+
+
+class HostNoiseController:
+    """Run repeatable unrelated host execs while an event-volume capture is active."""
+
+    def __init__(self, *, enabled: bool, command: str, interval_ms: int, workers: int) -> None:
+        self.enabled = enabled
+        self.command = command
+        self.interval_ms = interval_ms
+        self.workers = workers
+        self.processes: list[subprocess.Popen[str]] = []
+
+    def __enter__(self) -> "HostNoiseController":
+        if not self.enabled:
+            return self
+
+        delay = self.interval_ms / 1000.0
+        script = (
+            "while :; do "
+            f"{self.command}; "
+            f"sleep {delay:.6f}; "
+            "done"
+        )
+
+        for _ in range(self.workers):
+            popen_kwargs: dict[str, Any] = {
+                "text": True,
+                "stdout": subprocess.DEVNULL,
+                "stderr": subprocess.DEVNULL,
+            }
+            if sys.version_info >= (3, 11):
+                popen_kwargs["process_group"] = 0
+            else:
+                popen_kwargs["preexec_fn"] = os.setpgrp  # type: ignore[name-defined]
+
+            self.processes.append(subprocess.Popen(["/bin/sh", "-c", script], **popen_kwargs))
+
+        return self
+
+    def __exit__(self, exc_type: object, exc: object, tb: object) -> None:
+        for proc in self.processes:
+            if proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2)
+                except subprocess.TimeoutExpired:
+                    proc.kill()
+                    proc.wait(timeout=2)
+        self.processes.clear()
 
 
 def event_volume_reduction(host_wide_count: int, scoped_count: int) -> dict[str, float | int]:
@@ -491,27 +670,6 @@ def event_volume_reduction(host_wide_count: int, scoped_count: int) -> dict[str,
     }
 
 
-def environment_metadata(settings: Settings) -> dict[str, Any]:
-    return {
-        "base_url": settings.base_url,
-        "platform": platform.platform(),
-        "python": sys.version.split()[0],
-        "root": str(settings.root),
-        "monitor_bin": str(settings.monitor_bin),
-        "verifier_bin": str(settings.verifier_bin),
-    }
-
-
-def read_json_file(path: Path) -> dict[str, Any]:
-    if not path.exists():
-        return {}
-
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError as exc:
-        fail(f"invalid JSON in {path}: {exc}")
-
-
 def write_latency_csv(path: Path, result: dict[str, Any]) -> None:
     fieldnames = [
         "trial",
@@ -520,14 +678,17 @@ def write_latency_csv(path: Path, result: dict[str, Any]) -> None:
         "baseline_mean_ms",
         "baseline_median_ms",
         "baseline_p95_ms",
+        "baseline_p99_ms",
         "baseline_throughput_rps",
         "monitored_mean_ms",
         "monitored_median_ms",
         "monitored_p95_ms",
+        "monitored_p99_ms",
         "monitored_throughput_rps",
         "overhead_mean_pct",
         "overhead_median_pct",
         "overhead_p95_pct",
+        "overhead_p99_pct",
     ]
 
     latency = result["latency"]
@@ -545,14 +706,17 @@ def write_latency_csv(path: Path, result: dict[str, Any]) -> None:
                     "baseline_mean_ms": trial["baseline"]["mean_ms"],
                     "baseline_median_ms": trial["baseline"]["median_ms"],
                     "baseline_p95_ms": trial["baseline"]["p95_ms"],
+                    "baseline_p99_ms": trial["baseline"]["p99_ms"],
                     "baseline_throughput_rps": trial["baseline"]["throughput_rps"],
                     "monitored_mean_ms": trial["monitored"]["mean_ms"],
                     "monitored_median_ms": trial["monitored"]["median_ms"],
                     "monitored_p95_ms": trial["monitored"]["p95_ms"],
+                    "monitored_p99_ms": trial["monitored"]["p99_ms"],
                     "monitored_throughput_rps": trial["monitored"]["throughput_rps"],
                     "overhead_mean_pct": trial["overhead_pct"]["mean_ms"],
                     "overhead_median_pct": trial["overhead_pct"]["median_ms"],
                     "overhead_p95_pct": trial["overhead_pct"]["p95_ms"],
+                    "overhead_p99_pct": trial["overhead_pct"]["p99_ms"],
                 }
             )
 
@@ -563,7 +727,12 @@ def write_event_volume_csv(path: Path, result: dict[str, Any]) -> None:
         "endpoint",
         "event_requests",
         "event_duration_secs",
+        "host_noise_enabled",
+        "host_noise_workers",
         "event_count",
+        "synthetic_record_count",
+        "total_record_count",
+        "evidence_size_bytes",
         "top_exec_paths_json",
         "evidence",
         "summary",
@@ -583,18 +752,18 @@ def write_event_volume_csv(path: Path, result: dict[str, Any]) -> None:
                     "endpoint": event_volume["endpoint"],
                     "event_requests": event_volume["event_requests"],
                     "event_duration_secs": event_volume["event_duration_secs"],
+                    "host_noise_enabled": event_volume["host_noise"]["enabled"],
+                    "host_noise_workers": event_volume["host_noise"]["workers"],
                     "event_count": capture["event_count"],
+                    "synthetic_record_count": capture["synthetic_record_count"],
+                    "total_record_count": capture["total_record_count"],
+                    "evidence_size_bytes": capture["evidence_size_bytes"],
                     "top_exec_paths_json": json.dumps(capture["top_exec_paths"], sort_keys=True),
                     "evidence": capture["evidence"],
                     "summary": capture["summary"],
                     "monitor_log": capture["monitor_log"],
                 }
             )
-
-
-def safe_filename(name: str) -> str:
-    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
-    return safe or "runtime_perf"
 
 
 def config_from_args(args: argparse.Namespace, settings: Settings) -> PerformanceConfig:
@@ -612,6 +781,7 @@ def config_from_args(args: argparse.Namespace, settings: Settings) -> Performanc
         requests=args.requests,
         warmup_requests=args.warmup,
         trials=args.trials,
+        cooldown_secs=args.cooldown_secs,
         collection_mode=args.collection_mode,
         expected_evidence=expected,
         output_dir=output_dir,
@@ -620,11 +790,17 @@ def config_from_args(args: argparse.Namespace, settings: Settings) -> Performanc
         event_duration_secs=args.event_duration_secs,
         event_requests=args.event_requests,
         top_exec_paths=args.top_exec_paths,
+        host_noise=args.host_noise,
+        host_noise_command=args.host_noise_command,
+        host_noise_interval_ms=args.host_noise_interval_ms,
+        host_noise_workers=args.host_noise_workers,
     )
 
 
 def main() -> int:
     args = parse_args()
+    if args.allow_debug:
+        os.environ["ALLOW_DEBUG_BINARIES"] = "1"
     settings = Settings.from_env()
     config = config_from_args(args, settings)
     runner = PerformanceExperimentRunner(settings, config, build=not args.no_build)

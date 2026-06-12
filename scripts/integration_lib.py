@@ -8,17 +8,24 @@ evidence/verifier helpers.
 
 from __future__ import annotations
 
+import collections
+import hashlib
 import json
+import math
 import os
+import platform
+import random
 import shlex
+import statistics
 import subprocess
 import sys
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Mapping, TextIO
+from typing import Any, Callable, Iterator, Mapping, Sequence, TextIO
 
 
 class IntegrationFailure(RuntimeError):
@@ -49,6 +56,295 @@ def determine_privilege_prefix() -> list[str]:
         return []
 
     return ["sudo", "-n"]
+
+
+# ---------------------------------------------------------------------------
+# Reproducibility: build mode and environment capture
+# ---------------------------------------------------------------------------
+
+
+def build_mode(bin_path: Path) -> str:
+    """Infer the cargo build profile from a binary path under target/."""
+    parts = bin_path.parts
+    if "release" in parts:
+        return "release"
+    if "debug" in parts:
+        return "debug"
+    return "unknown"
+
+
+def assert_release_binaries(settings: "Settings") -> None:
+    """Fail fast if performance/security experiments would measure debug builds.
+
+    Debug Rust binaries are typically several-fold slower than release, so any
+    timing measured against them is not representative. Set
+    ``ALLOW_DEBUG_BINARIES=1`` to override (development only); the chosen build
+    mode is always recorded in ``environment_metadata`` regardless.
+    """
+    if os.environ.get("ALLOW_DEBUG_BINARIES", "0") == "1":
+        return
+
+    offenders = [
+        str(path)
+        for path in (settings.monitor_bin, settings.verifier_bin)
+        if build_mode(path) != "release"
+    ]
+    if offenders:
+        fail(
+            "refusing to run experiments against non-release binaries: "
+            + ", ".join(offenders)
+            + " — build with `cargo build --release` (scripts/build_all.sh now "
+            "does this) or set ALLOW_DEBUG_BINARIES=1 to override for development"
+        )
+
+
+def _tool_version(args: list[str]) -> str | None:
+    """Best-effort capture of an external tool version; never raises."""
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=5,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    output = (result.stdout or result.stderr or "").strip()
+    return output.splitlines()[0] if output else None
+
+
+def _cpu_model() -> str | None:
+    model = platform.processor()
+    if model:
+        return model
+    try:
+        for line in Path("/proc/cpuinfo").read_text(encoding="utf-8").splitlines():
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        return None
+    return None
+
+
+def _cpu_governor() -> str | None:
+    try:
+        return (
+            Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+            .read_text(encoding="utf-8")
+            .strip()
+        )
+    except OSError:
+        return None
+
+
+def sha256_file(path: Path) -> str | None:
+    """SHA-256 of a file's contents, or None if it cannot be read."""
+    try:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(65536), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def environment_metadata(settings: "Settings") -> dict[str, Any]:
+    """Capture a reproducibility manifest shared by every experiment runner.
+
+    Every probe is best-effort so capture never aborts an experiment. The
+    binary build mode is derived from the resolved path so the debug-vs-release
+    question is answered inside the artefact itself.
+    """
+    head = _tool_version(["git", "-C", str(settings.root), "rev-parse", "HEAD"])
+    dirty = _tool_version(["git", "-C", str(settings.root), "status", "--porcelain"])
+    return {
+        "captured_utc": datetime.now(timezone.utc).isoformat(),
+        # Host / OS
+        "platform": platform.platform(),
+        "kernel": _tool_version(["uname", "-r"]),
+        "cpu_model": _cpu_model(),
+        "cpu_cores": os.cpu_count(),
+        "cpu_governor": _cpu_governor(),
+        # Toolchain
+        "python": sys.version.split()[0],
+        "rustc": _tool_version(["rustc", "--version"]),
+        "cargo": _tool_version(["cargo", "--version"]),
+        # Security / runtime dependencies
+        "tpm2_tools": _tool_version(["tpm2", "--version"]),
+        "swtpm": _tool_version(["swtpm", "--version"]),
+        "docker": _tool_version(["docker", "--version"]),
+        # Repository state
+        "git_commit": head,
+        "git_dirty": bool(dirty),
+        # Binaries actually measured (answers debug-vs-release in the artefact)
+        "monitor_bin": str(settings.monitor_bin),
+        "verifier_bin": str(settings.verifier_bin),
+        "monitor_build_mode": build_mode(settings.monitor_bin),
+        "verifier_build_mode": build_mode(settings.verifier_bin),
+        "monitor_sha256": sha256_file(settings.monitor_bin),
+        "verifier_sha256": sha256_file(settings.verifier_bin),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Statistics: dispersion, percentiles, and bootstrap confidence intervals
+# ---------------------------------------------------------------------------
+
+
+def percentile(values: Sequence[float], q: float) -> float:
+    """Linear-interpolated percentile (q in [0, 100]); robust for small n."""
+    if not values:
+        fail("percentile of empty sequence")
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return float(ordered[0])
+    rank = (q / 100.0) * (len(ordered) - 1)
+    low = math.floor(rank)
+    high = math.ceil(rank)
+    if low == high:
+        return float(ordered[low])
+    weight = rank - low
+    return float(ordered[low] * (1.0 - weight) + ordered[high] * weight)
+
+
+def summary_stats(values: Sequence[float]) -> dict[str, Any]:
+    """min/max/mean/median/stdev/CoV/p95/p99 for a sample, with n.
+
+    Dispersion (stdev, CoV) is reported alongside every central-tendency number
+    so no point estimate is presented without its spread.
+    """
+    sample = [float(v) for v in values]
+    if not sample:
+        return {
+            "n": 0,
+            "min": None,
+            "max": None,
+            "mean": None,
+            "median": None,
+            "stdev": None,
+            "cov": None,
+            "p95": None,
+            "p99": None,
+        }
+    mean = statistics.fmean(sample)
+    stdev = statistics.stdev(sample) if len(sample) > 1 else 0.0
+    return {
+        "n": len(sample),
+        "min": min(sample),
+        "max": max(sample),
+        "mean": mean,
+        "median": statistics.median(sample),
+        "stdev": stdev,
+        "cov": (stdev / mean) if mean else None,
+        "p95": percentile(sample, 95.0),
+        "p99": percentile(sample, 99.0),
+    }
+
+
+def _resample(values: Sequence[float], rng: random.Random) -> list[float]:
+    return [values[rng.randrange(len(values))] for _ in range(len(values))]
+
+
+def bootstrap_ci(
+    values: Sequence[float],
+    statistic: Callable[[Sequence[float]], float] = statistics.median,
+    *,
+    confidence: float = 0.95,
+    iterations: int = 2000,
+    seed: int = 1234,
+) -> dict[str, Any]:
+    """Percentile bootstrap CI for an arbitrary statistic (median by default).
+
+    Pure-Python (no numpy/scipy). The seed is fixed for reproducibility — two
+    runs over the same sample yield the same interval.
+    """
+    sample = [float(v) for v in values]
+    if not sample:
+        return {"point": None, "low": None, "high": None, "confidence": confidence}
+    point = float(statistic(sample))
+    if len(sample) == 1:
+        return {"point": point, "low": point, "high": point, "confidence": confidence}
+    rng = random.Random(seed)
+    estimates = sorted(float(statistic(_resample(sample, rng))) for _ in range(iterations))
+    alpha = (1.0 - confidence) / 2.0
+    return {
+        "point": point,
+        "low": percentile(estimates, alpha * 100.0),
+        "high": percentile(estimates, (1.0 - alpha) * 100.0),
+        "confidence": confidence,
+    }
+
+
+def overhead_pct(baseline: float, measured: float) -> float:
+    """Percentage overhead of measured relative to baseline."""
+    if baseline == 0:
+        fail("cannot compute overhead against a zero baseline")
+    return (measured / baseline - 1.0) * 100.0
+
+
+def overhead_pct_inf(baseline: float, measured: float) -> float:
+    """Percentage overhead of measured relative to baseline.
+
+    Unlike :func:`overhead_pct`, a zero baseline yields ``inf`` rather than
+    raising. Experiment runners that compare wall/throughput aggregates use this
+    convention so a degenerate zero baseline does not abort the whole run.
+    """
+    if baseline == 0:
+        return float("inf")
+    return ((measured / baseline) - 1.0) * 100.0
+
+
+def percentile_nearest_rank(ordered_values: list[float], percentile: float) -> float:
+    if not ordered_values:
+        fail("cannot compute percentile of empty list")
+
+    if len(ordered_values) == 1:
+        return ordered_values[0]
+
+    index = int(round((percentile / 100.0) * (len(ordered_values) - 1)))
+    index = max(0, min(index, len(ordered_values) - 1))
+    return ordered_values[index]
+
+
+def overhead_ci(
+    baseline: Sequence[float],
+    measured: Sequence[float],
+    *,
+    statistic: Callable[[Sequence[float]], float] = statistics.median,
+    confidence: float = 0.95,
+    iterations: int = 2000,
+    seed: int = 1234,
+) -> dict[str, Any]:
+    """Bootstrap CI for the overhead percentage between two samples.
+
+    Resamples both samples independently and recomputes the overhead of the
+    chosen statistic (median by default), so the headline overhead number is
+    reported with an uncertainty interval rather than as a bare point estimate.
+    """
+    base = [float(v) for v in baseline]
+    meas = [float(v) for v in measured]
+    if not base or not meas:
+        return {"point": None, "low": None, "high": None, "confidence": confidence}
+    point = overhead_pct(float(statistic(base)), float(statistic(meas)))
+    rng = random.Random(seed)
+    estimates = []
+    for _ in range(iterations):
+        b = statistic(_resample(base, rng))
+        m = statistic(_resample(meas, rng))
+        if b:
+            estimates.append((m / b - 1.0) * 100.0)
+    if not estimates:
+        return {"point": point, "low": None, "high": None, "confidence": confidence}
+    estimates.sort()
+    alpha = (1.0 - confidence) / 2.0
+    return {
+        "point": point,
+        "low": percentile(estimates, alpha * 100.0),
+        "high": percentile(estimates, (1.0 - alpha) * 100.0),
+        "confidence": confidence,
+    }
 
 
 @dataclass(frozen=True)
@@ -96,8 +392,8 @@ class Settings:
             base_collector_config=collector_config_path,
             verifier_policy=verifier_policy_path,
             log_dir=resolve_path(root, os.environ.get("LOG_DIR", "logs/integration")),
-            monitor_bin=resolve_path(root, os.environ.get("MONITOR_BIN", "target/debug/runtime-monitor")),
-            verifier_bin=resolve_path(root, os.environ.get("VERIFIER_BIN", "target/debug/runtime-verifier")),
+            monitor_bin=resolve_path(root, os.environ.get("MONITOR_BIN", "target/release/runtime-monitor")),
+            verifier_bin=resolve_path(root, os.environ.get("VERIFIER_BIN", "target/release/runtime-verifier")),
             monitor_startup_secs=float(os.environ.get("MONITOR_STARTUP_SECS", "2")),
             monitor_startup_timeout_secs=float(os.environ.get("MONITOR_STARTUP_TIMEOUT_SECS", "10")),
             monitor_ready_pattern=os.environ.get("MONITOR_READY_PATTERN", ""),
@@ -121,6 +417,7 @@ class CasePaths:
 class EvidenceJsonRecord:
     line_number: int
     data: Mapping[str, Any]
+    raw_line: str = ""
 
 
 @dataclass(frozen=True)
@@ -152,7 +449,11 @@ def iter_evidence_records(path: Path) -> Iterator[EvidenceJsonRecord]:
             if not isinstance(data, dict):
                 fail(f"invalid evidence record in {path} at line {line_number}: expected JSON object")
 
-            yield EvidenceJsonRecord(line_number=line_number, data=data)
+            yield EvidenceJsonRecord(
+                line_number=line_number,
+                data=data,
+                raw_line=line.rstrip("\n"),
+            )
 
 
 def iter_runtime_evidence_events(path: Path) -> Iterator[RuntimeEvidenceEvent]:
@@ -204,6 +505,331 @@ def iter_runtime_evidence_events(path: Path) -> Iterator[RuntimeEvidenceEvent]:
             f"unsupported evidence record in {path} at line {parsed.line_number}: "
             "missing record_kind and not a legacy runtime event"
         )
+
+
+# ---------------------------------------------------------------------------
+# Tamper support: read, mutate, and re-serialise evidence records
+# ---------------------------------------------------------------------------
+
+
+def read_evidence_lines(path: Path) -> list[EvidenceJsonRecord]:
+    """Load every evidence record, preserving the exact source line text.
+
+    Returns a list (not a generator) so a tamper harness can index, reorder,
+    delete, and duplicate records before writing them back.
+    """
+    return list(iter_evidence_records(path))
+
+
+def serialise_record(record: EvidenceJsonRecord) -> str:
+    """Return the JSONL text for a record.
+
+    Untouched records keep their original bytes via ``raw_line`` so the
+    software-chain over them is unaffected; mutated records (built by
+    :func:`mutated_record`) carry a re-serialised ``raw_line``.
+    """
+    if record.raw_line:
+        return record.raw_line
+    return json.dumps(record.data, sort_keys=True)
+
+
+def mutated_record(record: EvidenceJsonRecord, new_data: Mapping[str, Any]) -> EvidenceJsonRecord:
+    """Build a record with replaced data and a matching re-serialised line."""
+    return EvidenceJsonRecord(
+        line_number=record.line_number,
+        data=new_data,
+        raw_line=json.dumps(new_data, sort_keys=True),
+    )
+
+
+def write_evidence_lines(path: Path, records: Sequence[EvidenceJsonRecord]) -> None:
+    """Write evidence records back to a JSONL file, one per line."""
+    path.write_text(
+        "".join(serialise_record(record) + "\n" for record in records),
+        encoding="utf-8",
+    )
+
+
+def deep_set(data: Mapping[str, Any], dotted_path: str, value: Any) -> dict[str, Any]:
+    """Return a deep copy of ``data`` with ``dotted_path`` set to ``value``.
+
+    Example: ``deep_set(rec.data, "record.event.exe_path", "/usr/bin/evil")``.
+    Fails if any intermediate key is missing, so a tamper operator cannot
+    silently no-op against an unexpected schema.
+    """
+    clone = json.loads(json.dumps(data))
+    keys = dotted_path.split(".")
+    cursor: Any = clone
+    for key in keys[:-1]:
+        if not isinstance(cursor, dict) or key not in cursor:
+            fail(f"deep_set: missing intermediate key {key!r} in path {dotted_path!r}")
+        cursor = cursor[key]
+    leaf = keys[-1]
+    if not isinstance(cursor, dict) or leaf not in cursor:
+        fail(f"deep_set: missing leaf key {leaf!r} in path {dotted_path!r}")
+    cursor[leaf] = value
+    return clone
+
+
+# ---------------------------------------------------------------------------
+# Verifier invocation that returns the structured report
+# ---------------------------------------------------------------------------
+
+
+def run_verifier_cli(
+    settings: "Settings",
+    runner: "CommandRunner",
+    *,
+    evidence: Path,
+    policy: Path | None = None,
+    summary: Path | None = None,
+    report: Path | None = None,
+    require_tpm_quote: bool = False,
+) -> subprocess.CompletedProcess[str]:
+    """Run the verifier over explicit paths (no CasePaths required).
+
+    Used by the security/tamper harness, which verifies arbitrary mutated
+    evidence/summary/policy triples rather than a single live case.
+    """
+    if not settings.verifier_bin.exists():
+        fail(f"missing verifier binary: {settings.verifier_bin}")
+
+    chosen_policy = policy or settings.verifier_policy
+    if not chosen_policy.exists():
+        fail(f"missing verifier policy: {chosen_policy}")
+
+    args: list[str | Path] = [
+        settings.verifier_bin,
+        "--policy",
+        chosen_policy,
+        "--evidence",
+        evidence,
+    ]
+    if summary is not None:
+        args.extend(["--summary", summary])
+    if report is not None:
+        args.extend(["--report", report])
+    if require_tpm_quote:
+        args.append("--require-tpm-quote")
+
+    return runner.run(args, check=False, capture=True)
+
+
+def read_report(path: Path) -> dict[str, Any]:
+    """Parse a verifier report JSON file (empty dict if absent/invalid)."""
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        fail(f"invalid verifier report JSON {path}: {exc}")
+    return data if isinstance(data, dict) else {}
+
+
+def failed_checks(report: Mapping[str, Any]) -> list[str]:
+    """Names of verifier checks that did not pass (value is not True)."""
+    checks = report.get("checks")
+    if not isinstance(checks, dict):
+        return []
+    return sorted(name for name, ok in checks.items() if ok is not True)
+
+
+# ---------------------------------------------------------------------------
+# Shared experiment-runner helpers (extracted verbatim from the experiment
+# scripts so the standalone runners can drop their copy-pasted equivalents).
+# ---------------------------------------------------------------------------
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        fail(f"invalid JSON in {path}: {exc}")
+
+
+def safe_filename(name: str, default: str) -> str:
+    safe = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in name)
+    return safe or default
+
+
+def case_paths(output_dir: Path, case_name: str) -> CasePaths:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    return CasePaths(
+        name=case_name,
+        collector_config=output_dir / f"collector_config_{case_name}.json",
+        evidence=output_dir / f"runtime_events_{case_name}.jsonl",
+        summary=output_dir / f"runtime_events_{case_name}.summary.json",
+        monitor_log=output_dir / f"integration_monitor_{case_name}.log",
+    )
+
+
+def clean_case(paths: CasePaths) -> None:
+    for path in [paths.collector_config, paths.evidence, paths.summary, paths.monitor_log]:
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def assert_fresh_evidence(paths: CasePaths, min_mtime: float) -> None:
+    if not paths.evidence.exists():
+        fail(f"missing evidence file {paths.evidence}")
+    if paths.evidence.stat().st_size == 0:
+        fail(f"evidence file is empty: {paths.evidence}")
+    if paths.evidence.stat().st_mtime < min_mtime:
+        fail(f"evidence file is stale: {paths.evidence}")
+
+
+def check_privileges(settings: "Settings", runner: "CommandRunner") -> None:
+    if not settings.privilege_prefix:
+        return
+
+    result = runner.run([*settings.privilege_prefix, "true"], check=False, capture=True)
+    if result.returncode == 0:
+        return
+    if result.stdout:
+        print(result.stdout, file=sys.stderr, end="")
+    fail("passwordless privilege escalation is required; run `sudo -v` first or run as root")
+
+
+def summarise_evidence(paths: CasePaths) -> dict[str, Any]:
+    total_record_count = 0
+    synthetic_record_count = 0
+    for parsed in iter_evidence_records(paths.evidence):
+        total_record_count += 1
+        if parsed.data.get("record_kind") == "synthetic":
+            synthetic_record_count += 1
+
+    event_count = 0
+    event_type_counts: collections.Counter[str] = collections.Counter()
+    workload_counts: collections.Counter[str] = collections.Counter()
+    exe_path_counts: collections.Counter[str] = collections.Counter()
+    classification_counts: collections.Counter[str] = collections.Counter()
+
+    for runtime_event in iter_runtime_evidence_events(paths.evidence):
+        event = runtime_event.event
+        record = runtime_event.record
+        event_count += 1
+        event_type_counts[str(event.get("event_type", "<missing>"))] += 1
+        workload_counts[str(event.get("workload_id", "<missing>"))] += 1
+        exe_path_counts[str(event.get("exe_path") or "<missing>")] += 1
+        classification = record.get("classification")
+        if classification is not None:
+            classification_counts[str(classification)] += 1
+
+    monitor_summary = read_json(paths.summary)
+    return {
+        "event_count": event_count,
+        "synthetic_record_count": synthetic_record_count,
+        "total_record_count": total_record_count,
+        "evidence_size_bytes": paths.evidence.stat().st_size if paths.evidence.exists() else 0,
+        # Ring-buffer drops self-reported by the monitor; surfaced so they can
+        # be tracked per mode rather than silently discarded.
+        "dropped_events": int(monitor_summary.get("dropped_events", 0)),
+        "event_type_counts": dict(event_type_counts.most_common()),
+        "workload_counts": dict(workload_counts.most_common()),
+        "classification_counts": dict(classification_counts.most_common()),
+        "top_exec_paths": [
+            {"exe_path": exe_path, "count": count} for exe_path, count in exe_path_counts.most_common(20)
+        ],
+        "events": str(paths.evidence),
+        "summary": str(paths.summary),
+        "monitor_log": str(paths.monitor_log),
+        "monitor_summary": monitor_summary,
+    }
+
+
+def run_verifier_timed(
+    settings: "Settings",
+    paths: CasePaths,
+    *,
+    policy: Path,
+    fail_message: str,
+) -> dict[str, Any]:
+    report_path = paths.summary.with_name(f"verification_report_{paths.name}.json")
+    args: list[str | Path] = [
+        settings.verifier_bin,
+        "--policy",
+        policy,
+        "--evidence",
+        paths.evidence,
+        "--summary",
+        paths.summary,
+        "--report",
+        report_path,
+    ]
+    rendered = [str(arg) for arg in args]
+    log("$ " + " ".join(shlex.quote(arg) for arg in rendered))
+    start_ns = time.perf_counter_ns()
+    completed = subprocess.run(
+        rendered,
+        cwd=settings.root,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
+
+    report: Mapping[str, Any] = {}
+    if report_path.exists():
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            fail(f"invalid verifier report JSON {report_path}: {exc}")
+
+    if completed.returncode != 0:
+        if completed.stdout:
+            print(completed.stdout, file=sys.stderr, end="")
+        fail(fail_message)
+
+    return {
+        "returncode": completed.returncode,
+        "wall_ms": elapsed_ms,
+        "stdout": completed.stdout,
+        "report": str(report_path),
+        "decision": report.get("decision"),
+        "reason": report.get("reason"),
+        "counts": report.get("counts"),
+    }
+
+
+def write_runtime_policy(verifier_policy: Path, paths: CasePaths, workload_ids: Sequence[str]) -> Path:
+    policy = json.loads(verifier_policy.read_text(encoding="utf-8"))
+    policy["workload_id"] = ",".join(workload_ids)
+    policy_path = paths.summary.with_name(f"runtime_policy_{paths.name}.json")
+    policy_path.write_text(
+        json.dumps(policy, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
+    return policy_path
+
+
+def write_multi_workload_collector_config(
+    paths: CasePaths,
+    *,
+    workloads: Sequence[Mapping[str, str]],
+    collection_mode: str,
+    runtime_policy: Path,
+    capture_argv: bool,
+) -> None:
+    config = {
+        "workloads": [
+            {"workload_id": workload["workload_id"], "container_name": workload["container_name"]}
+            for workload in workloads
+        ],
+        "collection_mode": collection_mode,
+        "evidence_out": str(paths.evidence),
+        "summary_out": str(paths.summary),
+        "runtime_policy": str(runtime_policy),
+        "capture_argv": capture_argv,
+    }
+    paths.collector_config.write_text(
+        json.dumps(config, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 class CommandRunner:
