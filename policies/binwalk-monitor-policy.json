@@ -1,0 +1,8 @@
+{
+  "workload_id": "binwalk",
+  "container_name": "binwalk-workload",
+  "collection_mode": "scoped",
+  "runtime_policy": "policies/binwalk-verifier-policy.json",
+  "evidence_out": "logs/experiments/runtime_events_binwalk.jsonl",
+  "summary_out": "logs/experiments/runtime_events_binwalk.summary.json"
+}

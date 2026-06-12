@@ -1,0 +1,15 @@
+name: fyp-binwalk-workload
+
+services:
+  binwalk:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: binwalk-workload
+    command: ["sleep", "infinity"]
+    volumes:
+      - ../../zip.bin:/samples/zip.bin:ro
+      - ../../bzip2.bin:/samples/bzip2.bin:ro
+      - ../../yaffs2.bin:/samples/yaffs2.bin:ro
+    labels:
+      fyp.workload: "binwalk"
