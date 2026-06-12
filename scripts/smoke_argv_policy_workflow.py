@@ -8,9 +8,13 @@ inside the configured Docker workload with `docker exec`; if that is not
 available, it falls back to host-wide capture of a local Python command.
 
 The important assertions are made on the marker-bearing exec-attempt evidence
-records themselves. Overall verifier ACCEPT-WITH-WARNINGS is allowed because
-Stage 9D does not correlate exec-attempt records with later successful
-sched_process_exec records, and successful exec records usually have empty argv.
+records themselves. A matching argv-sensitive invocation now yields overall
+verifier ACCEPT: the successful sched_process_exec shadow of an argv-sensitive
+path defers to its exec-attempt (rule `argv-sensitive-confirmed-by-attempt`)
+rather than being re-flagged for missing argv. ACCEPT-WITH-WARNINGS is still
+tolerated for the allowed case because host-wide fallback capture may record
+unrelated execs; a mismatched invocation remains ACCEPT-WITH-WARNINGS because its
+exec-attempt is classified suspicious.
 """
 
 from __future__ import annotations
@@ -408,8 +412,8 @@ def write_argv_sensitive_policy(
             "comm_names": [],
         },
         "attestation": {
-            "backend": "none",
-            "mode": "software-chain",
+            "backend": "software-chain",
+            "mode": "",
             "fail_on_suspicious": False,
             "fail_on_denied": True,
             "fail_on_drops": True,

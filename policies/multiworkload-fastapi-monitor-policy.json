@@ -1,0 +1,18 @@
+{
+  "workloads": [
+    {
+      "workload_id": "fastapi-a",
+      "container_name": "fastapi-a",
+      "runtime_policy": "policies/multiworkload-fastapi-a-verifier-policy.json"
+    },
+    {
+      "workload_id": "fastapi-b",
+      "container_name": "fastapi-b",
+      "runtime_policy": "policies/multiworkload-fastapi-b-verifier-policy.json"
+    }
+  ],
+  "collection_mode": "scoped",
+  "runtime_policy": "policies/multiworkload-fastapi-a-verifier-policy.json",
+  "evidence_out": "logs/experiments/runtime_events_multiworkload.jsonl",
+  "summary_out": "logs/experiments/runtime_events_multiworkload.summary.json"
+}

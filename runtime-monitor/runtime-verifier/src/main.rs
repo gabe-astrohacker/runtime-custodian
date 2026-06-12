@@ -1,7 +1,5 @@
 use anyhow::{Result, anyhow};
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File};
-use std::io::{BufRead, BufReader, BufWriter};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output};
 
@@ -9,8 +7,9 @@ use runtime_monitor_common::evidence::{RUNTIME_SUMMARY_SCHEMA_VERSION, RuntimeEv
 use runtime_monitor_common::{
     EventClassification, EvidenceEvent, EvidenceRecord, EvidenceSyntheticRecord, RuntimeEvent,
     RuntimePolicy, RuntimeSummary, SyntheticRecordType, classified_tpm_digest, classify_event,
-    event_hash, final_summary_digest, hex_decode_32, hex_encode, policy_hash, replay_pcr_extend,
-    session_start_digest, synthetic_record_hash,
+    classify_event_for_workload, combined_policy_hash, event_hash, final_summary_digest,
+    hex_decode_32, hex_encode, load_evidence_records, load_json, policy_hash, record_session_id,
+    replay_pcr_extend, session_start_digest, synthetic_record_hash, write_json_pretty,
 };
 
 const SUPPORTED_TPM_ATTESTATION_MODES: &[&str] = &["final-summary", "policy-triggered"];
@@ -18,6 +17,7 @@ const SUPPORTED_TPM_ATTESTATION_MODES: &[&str] = &["final-summary", "policy-trig
 #[derive(Debug)]
 struct Args {
     policy: PathBuf,
+    workload_policies: Vec<PathBuf>,
     evidence: PathBuf,
     summary: PathBuf,
     report: Option<PathBuf>,
@@ -235,19 +235,25 @@ fn parse_args() -> Result<Args> {
     let mut evidence = None;
     let mut summary = None;
     let mut report = None;
+    let mut workload_policies = Vec::new();
     let mut require_tpm_quote = false;
     let mut args = std::env::args().skip(1);
 
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--policy" => policy = args.next().map(PathBuf::from),
+            "--workload-policy" => {
+                if let Some(path) = args.next() {
+                    workload_policies.push(PathBuf::from(path));
+                }
+            }
             "--evidence" => evidence = args.next().map(PathBuf::from),
             "--summary" => summary = args.next().map(PathBuf::from),
             "--report" => report = args.next().map(PathBuf::from),
             "--require-tpm-quote" => require_tpm_quote = true,
             _ => {
                 return Err(anyhow!(
-                    "unknown argument `{arg}`; usage: runtime-verifier --policy <runtime_policy.json> --evidence <runtime_events.jsonl> --summary <runtime_summary.json> [--report <verification_report.json>] [--require-tpm-quote]"
+                    "unknown argument `{arg}`; usage: runtime-verifier --policy <runtime_policy.json> [--workload-policy <policy.json> ...] --evidence <runtime_events.jsonl> --summary <runtime_summary.json> [--report <verification_report.json>] [--require-tpm-quote]"
                 ));
             }
         }
@@ -255,60 +261,12 @@ fn parse_args() -> Result<Args> {
 
     Ok(Args {
         policy: policy.ok_or_else(|| anyhow!("missing --policy <runtime_policy.json>"))?,
+        workload_policies,
         evidence: evidence.ok_or_else(|| anyhow!("missing --evidence <runtime_events.jsonl>"))?,
         summary: summary.ok_or_else(|| anyhow!("missing --summary <runtime_summary.json>"))?,
         report,
         require_tpm_quote,
     })
-}
-
-fn load_json<T>(path: &Path, label: &str) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    let file =
-        File::open(path).map_err(|e| anyhow!("failed to open {label} {}: {e}", path.display()))?;
-    serde_json::from_reader(file)
-        .map_err(|e| anyhow!("failed to parse {label} {}: {e}", path.display()))
-}
-
-fn load_evidence_records(path: &Path) -> Result<Vec<EvidenceRecord>> {
-    let file =
-        File::open(path).map_err(|e| anyhow!("failed to open evidence {}: {e}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut records = Vec::new();
-    let mut line = String::new();
-    let mut line_no = 0usize;
-
-    loop {
-        line.clear();
-        let bytes_read = reader.read_line(&mut line).map_err(|e| {
-            anyhow!(
-                "failed to read evidence {} at line {}: {e}",
-                path.display(),
-                line_no + 1
-            )
-        })?;
-        if bytes_read == 0 {
-            break;
-        }
-        line_no += 1;
-
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        let record = serde_json::from_str::<EvidenceRecord>(&line).map_err(|e| {
-            anyhow!(
-                "failed to parse evidence {} at line {}: {e}",
-                path.display(),
-                line_no
-            )
-        })?;
-        records.push(record);
-    }
-
-    Ok(records)
 }
 
 fn default_report_path(summary_path: &Path) -> PathBuf {
@@ -321,9 +279,32 @@ fn report_path(args: &Args) -> PathBuf {
         .unwrap_or_else(|| default_report_path(&args.summary))
 }
 
+fn load_runtime_policies(
+    primary: &std::path::Path,
+    extras: &[PathBuf],
+) -> Result<Vec<RuntimePolicy>> {
+    let mut policies = vec![load_json::<RuntimePolicy>(primary, "runtime policy")?];
+    for path in extras {
+        policies.push(load_json::<RuntimePolicy>(path, "workload runtime policy")?);
+    }
+    // Policies are keyed by workload_id for per-event selection and the combined
+    // hash; reject ambiguous duplicates so both are well-defined.
+    for i in 0..policies.len() {
+        for j in (i + 1)..policies.len() {
+            if policies[i].workload_id == policies[j].workload_id {
+                return Err(anyhow!(
+                    "duplicate workload_id `{}` across runtime policies",
+                    policies[i].workload_id
+                ));
+            }
+        }
+    }
+    Ok(policies)
+}
+
 fn verify_from_paths(args: &Args) -> VerificationReport {
-    let policy = match load_json::<RuntimePolicy>(&args.policy, "runtime policy") {
-        Ok(policy) => policy,
+    let policies = match load_runtime_policies(&args.policy, &args.workload_policies) {
+        Ok(policies) => policies,
         Err(error) => {
             return VerificationReport::invalid_evidence(
                 None,
@@ -351,7 +332,7 @@ fn verify_from_paths(args: &Args) -> VerificationReport {
 
     let runner = SystemTpmQuoteCheckRunner;
     verify_replay_with_quote_runner(
-        &policy,
+        &policies,
         &summary,
         &records,
         &runner,
@@ -370,7 +351,7 @@ fn verify_replay(
 ) -> VerificationReport {
     let runner = NoopTpmQuoteCheckRunner;
     verify_replay_with_quote_runner(
-        policy,
+        std::slice::from_ref(policy),
         summary,
         records,
         &runner,
@@ -379,7 +360,7 @@ fn verify_replay(
 }
 
 fn verify_replay_with_quote_runner<R>(
-    policy: &RuntimePolicy,
+    policies: &[RuntimePolicy],
     summary: &RuntimeSummary,
     records: &[EvidenceRecord],
     quote_runner: &R,
@@ -388,6 +369,10 @@ fn verify_replay_with_quote_runner<R>(
 where
     R: TpmQuoteCheckRunner,
 {
+    // policies[0] is the primary policy: it supplies run-level attestation and
+    // decision configuration. Every policy (one per workload) is bound together
+    // by combined_policy_hash and used for per-workload classification.
+    let policy = &policies[0];
     let mut checks = VerificationChecks::all_valid();
     let mut first_suspicious_event = None;
     let mut first_denied_event = None;
@@ -405,21 +390,23 @@ where
         ));
     }
 
-    validate_summary_workload_identity(policy, summary, &mut checks, &mut structural_reasons);
+    validate_summary_workload_identity(policies, summary, &mut checks, &mut structural_reasons);
 
     let session_id = decode_hex_32_field(
         &summary.session_id,
         "summary.session_id",
+        None,
         &mut structural_reasons,
     );
     if session_id.is_none() {
         checks.session_valid = false;
     }
 
-    let expected_policy_hash = policy_hash(policy);
+    let expected_policy_hash = combined_policy_hash(policies);
     match decode_hex_32_field(
         &summary.policy_hash,
         "summary.policy_hash",
+        None,
         &mut structural_reasons,
     ) {
         Some(summary_policy_hash) if summary_policy_hash == expected_policy_hash => {}
@@ -437,6 +424,7 @@ where
     let summary_chain_head = match decode_hex_32_field(
         &summary.software_chain_head,
         "summary.software_chain_head",
+        None,
         &mut structural_reasons,
     ) {
         Some(summary_chain_head) => Some(summary_chain_head),
@@ -503,14 +491,14 @@ where
                 }
                 validate_runtime_event_workload_identity(
                     event,
-                    policy,
+                    policies,
                     summary,
                     &mut checks,
                     &mut structural_reasons,
                 );
                 replay_runtime_event(
                     event,
-                    policy,
+                    policies,
                     &mut state,
                     &mut checks,
                     &mut structural_reasons,
@@ -610,7 +598,7 @@ where
 }
 
 fn validate_summary_workload_identity(
-    policy: &RuntimePolicy,
+    policies: &[RuntimePolicy],
     summary: &RuntimeSummary,
     checks: &mut VerificationChecks,
     structural_reasons: &mut Vec<String>,
@@ -625,25 +613,33 @@ fn validate_summary_workload_identity(
         }
     }
 
-    if policy.workload_id.is_empty() || summary.workload_id == policy.workload_id {
+    let expected = expected_workload_ids(policies);
+    if expected.is_empty() {
+        return;
+    }
+
+    let actual = workload_id_set(&summary.workload_id);
+    if expected == actual {
         return;
     }
 
     checks.workload_identity_valid = false;
     structural_reasons.push(format!(
         "summary workload_id mismatch: expected {} got {}",
-        policy.workload_id, summary.workload_id
+        expected.join(","),
+        summary.workload_id
     ));
 }
 
 fn validate_runtime_event_workload_identity(
     event: &EvidenceEvent,
-    policy: &RuntimePolicy,
+    policies: &[RuntimePolicy],
     summary: &RuntimeSummary,
     checks: &mut VerificationChecks,
     structural_reasons: &mut Vec<String>,
 ) {
-    if policy.workload_id.is_empty() {
+    let expected = expected_workload_ids(policies);
+    if expected.is_empty() {
         return;
     }
 
@@ -654,7 +650,7 @@ fn validate_runtime_event_workload_identity(
     }
 
     let actual = event.event.workload_id.as_deref();
-    if actual == Some(policy.workload_id.as_str()) {
+    if actual.is_some_and(|workload_id| expected.contains(&workload_id)) {
         return;
     }
 
@@ -662,9 +658,31 @@ fn validate_runtime_event_workload_identity(
     structural_reasons.push(format!(
         "runtime event workload_id mismatch at seq_no {}: expected {} got {}",
         event.seq_no,
-        policy.workload_id,
+        expected.join(","),
         actual.unwrap_or("<missing>")
     ));
+}
+
+/// Union of all configured workload ids (sorted, deduped) across the policy set.
+fn expected_workload_ids(policies: &[RuntimePolicy]) -> Vec<&str> {
+    let mut ids = policies
+        .iter()
+        .flat_map(|policy| workload_id_set(&policy.workload_id))
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
+}
+
+fn workload_id_set(value: &str) -> Vec<&str> {
+    let mut ids = value
+        .split(',')
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .collect::<Vec<_>>();
+    ids.sort_unstable();
+    ids.dedup();
+    ids
 }
 
 #[derive(Default)]
@@ -710,7 +728,7 @@ impl TpmEventPolicy {
 
 fn replay_runtime_event(
     event: &EvidenceEvent,
-    policy: &RuntimePolicy,
+    policies: &[RuntimePolicy],
     state: &mut RuntimeEvidenceState,
     checks: &mut VerificationChecks,
     structural_reasons: &mut Vec<String>,
@@ -724,6 +742,7 @@ fn replay_runtime_event(
     match decode_hex_32_field(
         &event.event_hash,
         format!("EvidenceEvent.event_hash at seq_no {}", event.seq_no),
+        None,
         structural_reasons,
     ) {
         Some(recorded_event_hash) if recorded_event_hash == recomputed_event_hash => {}
@@ -739,7 +758,7 @@ fn replay_runtime_event(
         None => checks.event_hashes_valid = false,
     }
 
-    let recomputed_classification = classify_event(&event.event, policy);
+    let recomputed_classification = classify_event_for_workload(&event.event, policies);
     if event.classification != recomputed_classification.classification {
         checks.classification_valid = false;
         structural_reasons.push(format!(
@@ -906,6 +925,7 @@ fn replay_synthetic_record(
             "EvidenceSyntheticRecord.record_hash at seq_no {}",
             record.seq_no
         ),
+        None,
         structural_reasons,
     ) {
         Some(recorded_hash) if recorded_hash == recomputed_record_hash => {}
@@ -1554,14 +1574,12 @@ fn decode_tpm_hex_32_field(
     checks: &mut VerificationChecks,
     structural_reasons: &mut Vec<String>,
 ) -> Option<[u8; 32]> {
-    match hex_decode_32(value) {
-        Ok(decoded) => Some(decoded),
-        Err(error) => {
-            checks.tpm_summary_valid = false;
-            structural_reasons.push(format!("invalid {label}: {error}"));
-            None
-        }
-    }
+    decode_hex_32_field(
+        value,
+        label,
+        Some(&mut checks.tpm_summary_valid),
+        structural_reasons,
+    )
 }
 
 fn validate_quote_nonce(value: &str) -> Result<String> {
@@ -1657,7 +1675,7 @@ fn compare_chain_head(
     checks: &mut VerificationChecks,
     structural_reasons: &mut Vec<String>,
 ) {
-    match decode_hex_32_field(recorded, label, structural_reasons) {
+    match decode_hex_32_field(recorded, label, None, structural_reasons) {
         Some(recorded_chain_head) if recorded_chain_head == expected => {}
         Some(_) => {
             checks.software_chain_valid = false;
@@ -1672,13 +1690,6 @@ fn compare_chain_head(
     }
 }
 
-fn record_session_id(record: &EvidenceRecord) -> &str {
-    match record {
-        EvidenceRecord::RuntimeEvent(event) => &event.session_id,
-        EvidenceRecord::Synthetic(record) => &record.session_id,
-    }
-}
-
 fn record_seq_no(record: &EvidenceRecord) -> u64 {
     match record {
         EvidenceRecord::RuntimeEvent(event) => event.seq_no,
@@ -1689,11 +1700,15 @@ fn record_seq_no(record: &EvidenceRecord) -> u64 {
 fn decode_hex_32_field(
     value: &str,
     label: impl AsRef<str>,
+    invalid_flag: Option<&mut bool>,
     structural_reasons: &mut Vec<String>,
 ) -> Option<[u8; 32]> {
     match hex_decode_32(value) {
         Ok(decoded) => Some(decoded),
         Err(error) => {
+            if let Some(invalid_flag) = invalid_flag {
+                *invalid_flag = false;
+            }
             structural_reasons.push(format!("invalid {}: {error}", label.as_ref()));
             None
         }
@@ -1794,29 +1809,7 @@ fn counts_from_state(state: &RuntimeEvidenceState, dropped: u64) -> Verification
 }
 
 fn write_report(report: &VerificationReport, path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent()
-        && !parent.as_os_str().is_empty()
-    {
-        fs::create_dir_all(parent).map_err(|e| {
-            anyhow!(
-                "failed to create verification report directory {}: {e}",
-                parent.display()
-            )
-        })?;
-    }
-
-    let file = File::create(path).map_err(|e| {
-        anyhow!(
-            "failed to create verification report {}: {e}",
-            path.display()
-        )
-    })?;
-    serde_json::to_writer_pretty(BufWriter::new(file), report).map_err(|e| {
-        anyhow!(
-            "failed to write verification report {}: {e}",
-            path.display()
-        )
-    })
+    write_json_pretty(path, report, "verification report")
 }
 
 fn main() -> Result<()> {
@@ -2047,6 +2040,118 @@ mod tests {
         (events, summary)
     }
 
+    fn two_workload_policies() -> (RuntimePolicy, RuntimePolicy) {
+        let mut policy_a = base_policy();
+        policy_a.workload_id = String::from("wl-a");
+        policy_a.acceptable.exec_paths = vec![String::from("/usr/bin/a")];
+        policy_a.denied = DeniedPolicy::default();
+        let mut policy_b = base_policy();
+        policy_b.workload_id = String::from("wl-b");
+        policy_b.acceptable.exec_paths = vec![String::from("/usr/bin/b")];
+        policy_b.denied = DeniedPolicy::default();
+        (policy_a, policy_b)
+    }
+
+    fn multi_policy_fixture(
+        policies: &[RuntimePolicy],
+        events: Vec<(&str, RuntimeEvent)>,
+    ) -> (Vec<EvidenceRecord>, RuntimeSummary) {
+        let mut state = RuntimeEvidenceState::new(SESSION_ID);
+        let mut records = Vec::new();
+        push_synthetic(
+            &mut records,
+            &mut state,
+            SyntheticRecordType::MonitorStart,
+            "monitor session started",
+        );
+        push_synthetic(
+            &mut records,
+            &mut state,
+            SyntheticRecordType::PolicyLoaded,
+            "runtime policy loaded from configured policy",
+        );
+        push_synthetic(
+            &mut records,
+            &mut state,
+            SyntheticRecordType::WorkloadTargetBound,
+            "workload targets bound: collection_mode=scoped workloads=wl-a,wl-b",
+        );
+        for (workload_id, mut event) in events {
+            event.workload_id = Some(workload_id.to_owned());
+            let policy = policies
+                .iter()
+                .find(|policy| policy.workload_id == workload_id)
+                .expect("policy for workload");
+            push_runtime(&mut records, &mut state, policy, event);
+        }
+        push_synthetic(
+            &mut records,
+            &mut state,
+            SyntheticRecordType::MonitorStop,
+            "monitor session stopped",
+        );
+
+        let mut summary = summary_for(&policies[0], &state);
+        summary.workload_id = String::from("wl-a,wl-b");
+        summary.policy_hash = hex_encode(&combined_policy_hash(policies));
+        (records, summary)
+    }
+
+    #[test]
+    fn per_workload_policies_classify_each_workload_independently() {
+        let (policy_a, policy_b) = two_workload_policies();
+        let policies = vec![policy_a, policy_b];
+        let (records, summary) = multi_policy_fixture(
+            &policies,
+            vec![
+                ("wl-a", runtime_event("/usr/bin/a")),
+                ("wl-b", runtime_event("/usr/bin/b")),
+            ],
+        );
+
+        let report = verify_replay_with_quote_runner(
+            &policies,
+            &summary,
+            &records,
+            &NoopTpmQuoteCheckRunner,
+            QuoteVerificationOptions::default_for_tests(),
+        );
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert_eq!(report.counts.acceptable, 2);
+        assert!(report.checks.classification_valid);
+        assert!(report.checks.policy_hash_valid);
+        assert!(report.checks.workload_identity_valid);
+    }
+
+    #[test]
+    fn per_workload_policy_flags_cross_workload_behaviour() {
+        // /usr/bin/b is acceptable for wl-b but not for wl-a: running it under
+        // wl-a must be suspicious under wl-a's own policy.
+        let (policy_a, policy_b) = two_workload_policies();
+        let policies = vec![policy_a, policy_b];
+        let (records, summary) = multi_policy_fixture(
+            &policies,
+            vec![
+                ("wl-a", runtime_event("/usr/bin/b")),
+                ("wl-b", runtime_event("/usr/bin/b")),
+            ],
+        );
+
+        let report = verify_replay_with_quote_runner(
+            &policies,
+            &summary,
+            &records,
+            &NoopTpmQuoteCheckRunner,
+            QuoteVerificationOptions::default_for_tests(),
+        );
+
+        assert_eq!(report.decision, VerificationDecision::AcceptWithWarnings);
+        assert_eq!(report.counts.acceptable, 1);
+        assert_eq!(report.counts.suspicious, 1);
+        assert!(report.checks.classification_valid);
+    }
+
     fn summary_for(policy: &RuntimePolicy, state: &RuntimeEvidenceState) -> RuntimeSummary {
         RuntimeSummary {
             schema_version: RUNTIME_SUMMARY_SCHEMA_VERSION,
@@ -2179,7 +2284,7 @@ mod tests {
         R: TpmQuoteCheckRunner,
     {
         verify_replay_with_quote_runner(
-            policy,
+            std::slice::from_ref(policy),
             summary,
             events,
             runner,
@@ -2200,6 +2305,24 @@ mod tests {
         assert_eq!(report.decision, VerificationDecision::Accept);
         assert_eq!(report.counts.acceptable, 1);
         assert_eq!(report.counts.synthetic, 4);
+    }
+
+    #[test]
+    fn scoped_multi_workload_policy_accepts_any_bound_workload_id() {
+        let mut policy = base_policy();
+        policy.workload_id = String::from("workload-a,workload-b");
+
+        let mut second_event = runtime_event("/usr/bin/echo");
+        second_event.workload_id = Some(String::from("workload-b"));
+        let (events, mut summary) =
+            evidence_fixture(&policy, vec![runtime_event("/usr/bin/echo"), second_event]);
+        summary.workload_id = String::from("workload-b,workload-a");
+
+        let report = verify_fixture(&policy, &events, &summary);
+
+        assert_eq!(report.decision, VerificationDecision::Accept);
+        assert_eq!(report.counts.acceptable, 2);
+        assert!(report.checks.workload_identity_valid);
     }
 
     #[test]

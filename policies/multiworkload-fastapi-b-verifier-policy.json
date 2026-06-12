@@ -1,0 +1,33 @@
+{
+  "workload_id": "fastapi-b",
+  "profile_mode": "minimal-behaviour",
+  "acceptable": {
+    "exec_paths": [
+      "/usr/local/bin/python",
+      "/usr/bin/id"
+    ],
+    "event_types": [
+      "fork"
+    ]
+  },
+  "suspicious": {
+    "unknown_exec_path": true
+  },
+  "denied": {
+    "exec_paths": [
+      "/bin/sh",
+      "/bin/bash"
+    ],
+    "comm_names": [
+      "sh",
+      "bash"
+    ]
+  },
+  "attestation": {
+    "backend": "software-chain",
+    "mode": "",
+    "fail_on_suspicious": false,
+    "fail_on_denied": true,
+    "fail_on_drops": true
+  }
+}

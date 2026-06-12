@@ -7,13 +7,14 @@ license.workspace = true
 
 [features]
 default = []
-user = ["aya", "anyhow", "serde", "sha2"]
+user = ["aya", "anyhow", "serde", "serde_json", "sha2"]
 
 [dependencies]
 aya = { workspace = true, optional = true }
 bytemuck = { workspace = true }
 anyhow = { workspace = true, optional = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
 
 [dev-dependencies]

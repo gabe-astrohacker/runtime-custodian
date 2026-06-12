@@ -19,8 +19,9 @@ use runtime_monitor_common::{
     COLLECTION_MODE_HOST_WIDE, COLLECTION_MODE_SCOPED, Event, EvidenceRecord,
     EvidenceSyntheticRecord, MonitorState, RuntimeEvent, RuntimePolicy, RuntimeSummary,
     SyntheticRecordType, TargetWorkload, TpmQuoteSummary, TpmSummary, UNKNOWN_WORKLOAD_INDEX,
-    classified_tpm_digest, classify_event, event_hash, final_summary_digest, generate_session_id,
-    hex_encode, policy_hash, session_start_digest, synthetic_record_hash,
+    classified_tpm_digest, classify_event_for_workload, combined_policy_hash, event_hash,
+    final_summary_digest, generate_session_id, hex_encode, policy_hash, session_start_digest,
+    synthetic_record_hash,
 };
 
 mod tpm;
@@ -37,6 +38,8 @@ struct CgroupFileHandle {
 struct WorkloadConfig {
     workload_id: String,
     container_name: String,
+    #[serde(default)]
+    runtime_policy: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -152,6 +155,7 @@ impl CollectorConfig {
             Self::Single(config) => vec![WorkloadConfig {
                 workload_id: config.workload_id.clone(),
                 container_name: config.container_name.clone(),
+                runtime_policy: None,
             }],
             Self::Multi(config) => config.workloads.clone(),
         }
@@ -272,7 +276,7 @@ struct EvidenceCapture {
     summary_workload_id: String,
     collection_mode: CollectionMode,
     writer: BufWriter<File>,
-    policy: RuntimePolicy,
+    policies: Vec<RuntimePolicy>,
     policy_hash: [u8; 32],
     policy_hash_hex: String,
     session_id_hex: String,
@@ -299,15 +303,35 @@ impl EvidenceCapture {
         policy_source: PolicySource,
         tpm_config: tpm::TpmConfig,
     ) -> Result<Self> {
+        Self::with_policies(
+            evidence_out,
+            summary_out,
+            workloads,
+            collection_mode,
+            vec![policy],
+            policy_source,
+            tpm_config,
+        )
+    }
+
+    fn with_policies(
+        evidence_out: PathBuf,
+        summary_out: PathBuf,
+        workloads: &[WorkloadConfig],
+        collection_mode: CollectionMode,
+        policies: Vec<RuntimePolicy>,
+        policy_source: PolicySource,
+        tpm_config: tpm::TpmConfig,
+    ) -> Result<Self> {
         let session_id = generate_session_id();
-        let policy_hash = policy_hash(&policy);
+        let policy_hash = combined_policy_hash(&policies);
         let policy_hash_hex = hex_encode(&policy_hash);
         let mut capture = Self {
             summary_out,
             summary_workload_id: workload_summary_id(workloads, collection_mode),
             collection_mode,
             writer: create_evidence_writer(evidence_out)?,
-            policy,
+            policies,
             policy_hash,
             policy_hash_hex,
             session_id_hex: hex_encode(&session_id),
@@ -400,7 +424,7 @@ impl EvidenceCapture {
         let workload_id = workload_id_for_index(workloads, ev.workload_index)?.map(str::to_owned);
         let runtime_event = RuntimeEvent::from_raw_event(&ev, workload_id);
         let seq_no = self.state.advance_sequence();
-        let classification = classify_event(&runtime_event, &self.policy);
+        let classification = classify_event_for_workload(&runtime_event, &self.policies);
         let event_classification = classification.classification;
         let event_hash_bytes = event_hash(&self.state.session_id, seq_no, &runtime_event);
         let software_chain_head = self.state.update_chain(event_hash_bytes);
@@ -823,7 +847,7 @@ impl EvidenceCapture {
     }
 
     fn summary_attestation_status_and_reason(&self) -> (String, Option<String>) {
-        let (status, reason) = attestation_status_and_reason(&self.state, &self.policy);
+        let (status, reason) = attestation_status_and_reason(&self.state, &self.policies[0]);
         let mut status = status.to_owned();
         let mut reason = reason;
 
@@ -910,6 +934,39 @@ fn load_collector_config(path: impl AsRef<Path>) -> Result<CollectorConfig> {
     })?;
     validate_collector_config(&config)?;
     Ok(config)
+}
+
+/// Build the policy set: the primary (run-level attestation) policy plus any
+/// per-workload policies, keyed by `workload_id`. A single policy preserves the
+/// existing single-policy behaviour exactly. Identical duplicates are merged;
+/// two different policies claiming the same `workload_id` are a configuration
+/// error. The monitor and verifier compute `combined_policy_hash` over this set,
+/// so the verifier must be given the same policy files.
+fn build_workload_policy_set(
+    primary: RuntimePolicy,
+    workloads: &[WorkloadConfig],
+) -> Result<Vec<RuntimePolicy>> {
+    let mut policies = vec![primary];
+    for workload in workloads {
+        let Some(path) = workload.runtime_policy.as_deref() else {
+            continue;
+        };
+        let policy = load_runtime_policy(path)?;
+        if let Some(existing) = policies
+            .iter()
+            .find(|candidate| candidate.workload_id == policy.workload_id)
+        {
+            if *existing != policy {
+                return Err(anyhow!(
+                    "conflicting runtime policies for workload_id `{}`",
+                    policy.workload_id
+                ));
+            }
+            continue;
+        }
+        policies.push(policy);
+    }
+    Ok(policies)
 }
 
 fn load_runtime_policy(path: impl AsRef<Path>) -> Result<RuntimePolicy> {
@@ -1364,7 +1421,7 @@ async fn main() -> Result<()> {
         .summary_out()
         .map(PathBuf::from)
         .unwrap_or_else(|| default_summary_path_for_evidence(&evidence_out));
-    let (runtime_policy, policy_source) = if let Some(path) = collector_config.runtime_policy() {
+    let (primary_policy, policy_source) = if let Some(path) = collector_config.runtime_policy() {
         (load_runtime_policy(path)?, PolicySource::Configured)
     } else {
         warn!(
@@ -1373,17 +1430,18 @@ async fn main() -> Result<()> {
         (RuntimePolicy::default(), PolicySource::Defaulted)
     };
     let tpm_config = tpm::TpmConfig::from_policy_and_local_options(
-        &runtime_policy.attestation,
+        &primary_policy.attestation,
         collector_config.tpm_local_options(),
     )?;
     log_tpm_config(&tpm_config);
+    let policies = build_workload_policy_set(primary_policy, &workloads)?;
     let tpm_runner = tpm::SystemTpmCommandRunner;
-    let mut evidence = EvidenceCapture::new(
+    let mut evidence = EvidenceCapture::with_policies(
         evidence_out,
         summary_out,
         &workloads,
         collection_mode,
-        runtime_policy,
+        policies,
         policy_source,
         tpm_config,
     )?;
@@ -1830,6 +1888,7 @@ mod tests {
         vec![WorkloadConfig {
             workload_id: String::from("workload-a"),
             container_name: String::from("container-a"),
+            runtime_policy: None,
         }]
     }
 

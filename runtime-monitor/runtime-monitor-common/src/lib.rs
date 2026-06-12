@@ -89,11 +89,18 @@ pub struct Event {
 pub mod evidence;
 
 #[cfg(feature = "user")]
+pub mod io;
+
+#[cfg(feature = "user")]
+pub use io::{load_evidence_records, load_json, record_session_id, write_json_pretty};
+
+#[cfg(feature = "user")]
 pub use evidence::{
     AcceptableInvocationPolicy, AcceptablePolicy, AttestationPolicy, ClassificationResult,
     DeniedPolicy, EventClassification, EvidenceEvent, EvidenceRecord, EvidenceSyntheticRecord,
     InvocationMatchType, RuntimeEvent, RuntimePolicy, RuntimeSummary, SuspiciousPolicy,
     SyntheticRecordType, TpmQuoteSummary, TpmSummary, classified_tpm_digest, classify_event,
-    event_hash, final_summary_digest, generate_session_id, hex_decode_32, hex_encode, policy_hash,
-    replay_pcr_extend, session_start_digest, synthetic_record_hash, update_software_chain,
+    classify_event_for_workload, combined_policy_hash, event_hash, final_summary_digest,
+    generate_session_id, hex_decode_32, hex_encode, policy_hash, replay_pcr_extend,
+    session_start_digest, synthetic_record_hash, update_software_chain,
 };

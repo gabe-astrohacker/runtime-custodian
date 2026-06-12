@@ -12,6 +12,7 @@ use std::vec::Vec;
 const EVENT_DOMAIN: &[u8] = b"rta-event-v1";
 const SOFTWARE_CHAIN_DOMAIN: &[u8] = b"rta-software-chain-v1";
 const POLICY_DOMAIN: &[u8] = b"rta-policy-v1";
+const POLICY_SET_DOMAIN: &[u8] = b"rta-policy-set-v1";
 const SYNTHETIC_RECORD_DOMAIN: &[u8] = b"rta-synthetic-record-v1";
 const CLASSIFIED_TPM_EVENT_DOMAIN: &[u8] = b"rta-classified-event-v1";
 const FINAL_SUMMARY_DOMAIN: &[u8] = b"rta-final-summary-v1";
@@ -813,6 +814,67 @@ pub fn policy_hash(policy: &RuntimePolicy) -> [u8; 32] {
     finalize_sha256(hasher)
 }
 
+/// Bind a set of per-workload policies into one hash for TPM/session anchoring.
+///
+/// A single policy hashes identically to [`policy_hash`], so single-workload
+/// evidence and all existing fixtures are unchanged. For multiple policies the
+/// per-policy hashes are folded in `workload_id` order, so configuration order
+/// does not affect the result. Each `policy_hash` already binds its own
+/// `workload_id`, so folding the hashes uniquely commits the whole set.
+pub fn combined_policy_hash(policies: &[RuntimePolicy]) -> [u8; 32] {
+    if let [single] = policies {
+        return policy_hash(single);
+    }
+
+    let mut entries: Vec<(String, [u8; 32])> = policies
+        .iter()
+        .map(|policy| (policy.workload_id.clone(), policy_hash(policy)))
+        .collect();
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut hasher = Sha256::new();
+    hasher.update(POLICY_SET_DOMAIN);
+    let count = u32::try_from(entries.len()).expect("policy set too large to encode");
+    hasher.update(count.to_le_bytes());
+    for (_, hash) in &entries {
+        hasher.update(hash);
+    }
+    finalize_sha256(hasher)
+}
+
+/// Classify an event against the policy for its workload.
+///
+/// With a single policy this is exactly [`classify_event`] (so single-workload
+/// behaviour is unchanged). With multiple policies the event's `workload_id`
+/// selects its policy; an event whose workload has no configured policy is
+/// `Suspicious` by default, so an unscoped or misconfigured workload fails
+/// closed rather than borrowing another workload's allowlist. The monitor and
+/// verifier share this function so they always agree on the selected policy.
+pub fn classify_event_for_workload(
+    event: &RuntimeEvent,
+    policies: &[RuntimePolicy],
+) -> ClassificationResult {
+    if let [single] = policies {
+        return classify_event(event, single);
+    }
+
+    match event
+        .workload_id
+        .as_deref()
+        .and_then(|id| policies.iter().find(|policy| policy.workload_id == id))
+    {
+        Some(policy) => classify_event(event, policy),
+        None => ClassificationResult {
+            classification: EventClassification::Suspicious,
+            rule_id: String::from("no-policy-for-workload"),
+            reason: match event.workload_id.as_deref() {
+                Some(id) => format!("no runtime policy is configured for workload {id}"),
+                None => String::from("event has no workload id and no single policy applies"),
+            },
+        },
+    }
+}
+
 pub fn classify_event(event: &RuntimeEvent, policy: &RuntimePolicy) -> ClassificationResult {
     // Denied rules always win.
     if let Some(reason) = deny_by_exec_path(event, policy) {
@@ -945,11 +1007,26 @@ fn classify_argv_sensitive_invocation(
     event: &RuntimeEvent,
     policy: &RuntimePolicy,
 ) -> Option<ClassificationResult> {
-    // Stage 9D does not correlate exec-attempt records with later successful
-    // sched_process_exec records. Successful exec records usually have empty
-    // argv and only match if an empty-argv invocation is explicitly allowed.
     if !is_argv_sensitive_exec_path(&event.exe_path, policy) {
         return None;
+    }
+
+    // The argv-sensitive decision is made on the exec-attempt (sys_enter_execve),
+    // which is the record that carries argv. A successful sched_process_exec of
+    // the same argv-sensitive path is the benign shadow of an already-judged
+    // attempt and never carries argv, so accept it here rather than re-flagging
+    // it for missing argv evidence. This assumes argv capture is enabled for the
+    // workload (an argv-sensitive path is meaningless without it); a lost attempt
+    // is surfaced by drop/sequence accounting, not by per-event correlation.
+    if event.event_type.is_exec() {
+        return Some(ClassificationResult {
+            classification: EventClassification::Acceptable,
+            rule_id: String::from("argv-sensitive-confirmed-by-attempt"),
+            reason: format!(
+                "argv-sensitive exec path {} is judged on its exec-attempt evidence",
+                event.exe_path
+            ),
+        });
     }
 
     if !event.argv_evidence_complete_for_sensitive_match() {
@@ -1972,7 +2049,11 @@ mod tests {
     }
 
     #[test]
-    fn argv_sensitive_successful_exec_with_empty_argv_requires_explicit_empty_invocation() {
+    fn argv_sensitive_successful_exec_defers_to_exec_attempt() {
+        // A successful sched_process_exec (no argv) of an argv-sensitive path is
+        // the benign shadow of its exec-attempt: it is accepted here, and the
+        // argv decision is made on the exec-attempt record instead. Without this,
+        // every interpreter invocation would emit a spurious suspicious shadow.
         let mut policy = sample_policy();
         policy.acceptable.argv_sensitive_exec_paths = vec![String::from("/usr/local/bin/python")];
         policy.acceptable.allowed_invocations = vec![AcceptableInvocationPolicy {
@@ -1984,27 +2065,99 @@ mod tests {
             ],
             match_type: InvocationMatchType::Exact,
         }];
-        let mut event = sample_event();
-        event.argv_complete = true;
-
-        let result = classify_event(&event, &policy);
-
-        assert_eq!(result.classification, EventClassification::Suspicious);
-        assert_eq!(result.rule_id, "argv-sensitive-mismatch");
-
-        policy
-            .acceptable
-            .allowed_invocations
-            .push(AcceptableInvocationPolicy {
-                exe_path: String::from("/usr/local/bin/python"),
-                argv: Vec::new(),
-                match_type: InvocationMatchType::Exact,
-            });
+        let event = sample_event();
+        assert!(event.event_type.is_exec());
+        assert!(event.argv.is_empty());
 
         let result = classify_event(&event, &policy);
 
         assert_eq!(result.classification, EventClassification::Acceptable);
-        assert_eq!(result.rule_id, "acceptable-argv-invocation");
+        assert_eq!(result.rule_id, "argv-sensitive-confirmed-by-attempt");
+    }
+
+    #[test]
+    fn combined_policy_hash_single_equals_policy_hash() {
+        let policy = sample_policy();
+        assert_eq!(combined_policy_hash(&[policy.clone()]), policy_hash(&policy));
+    }
+
+    #[test]
+    fn combined_policy_hash_is_order_independent() {
+        let mut a = sample_policy();
+        a.workload_id = String::from("wl-a");
+        let mut b = sample_policy();
+        b.workload_id = String::from("wl-b");
+
+        assert_eq!(
+            combined_policy_hash(&[a.clone(), b.clone()]),
+            combined_policy_hash(&[b, a])
+        );
+    }
+
+    #[test]
+    fn combined_policy_hash_depends_on_each_member_policy() {
+        let mut a = sample_policy();
+        a.workload_id = String::from("wl-a");
+        let mut b = sample_policy();
+        b.workload_id = String::from("wl-b");
+        let baseline = combined_policy_hash(&[a.clone(), b.clone()]);
+
+        b.acceptable.exec_paths.push(String::from("/usr/bin/extra"));
+        assert_ne!(baseline, combined_policy_hash(&[a, b]));
+    }
+
+    #[test]
+    fn classify_event_for_workload_selects_policy_by_workload_id() {
+        let mut policy_a = sample_policy();
+        policy_a.workload_id = String::from("wl-a");
+        policy_a.acceptable.exec_paths = vec![String::from("/usr/bin/a")];
+        let mut policy_b = sample_policy();
+        policy_b.workload_id = String::from("wl-b");
+        policy_b.acceptable.exec_paths = vec![String::from("/usr/bin/b")];
+        let policies = vec![policy_a, policy_b];
+
+        let mut event = sample_event();
+        event.exe_path = String::from("/usr/bin/a");
+
+        event.workload_id = Some(String::from("wl-a"));
+        assert_eq!(
+            classify_event_for_workload(&event, &policies).classification,
+            EventClassification::Acceptable
+        );
+
+        // The same exec is suspicious under wl-b's policy (not in its allowlist).
+        event.workload_id = Some(String::from("wl-b"));
+        let result = classify_event_for_workload(&event, &policies);
+        assert_eq!(result.classification, EventClassification::Suspicious);
+        assert_eq!(result.rule_id, "unknown-exec-path");
+    }
+
+    #[test]
+    fn classify_event_for_workload_unmatched_workload_fails_closed() {
+        let mut policy_a = sample_policy();
+        policy_a.workload_id = String::from("wl-a");
+        let mut policy_b = sample_policy();
+        policy_b.workload_id = String::from("wl-b");
+        let policies = vec![policy_a, policy_b];
+
+        let mut event = sample_event();
+        event.workload_id = Some(String::from("wl-unknown"));
+
+        let result = classify_event_for_workload(&event, &policies);
+        assert_eq!(result.classification, EventClassification::Suspicious);
+        assert_eq!(result.rule_id, "no-policy-for-workload");
+    }
+
+    #[test]
+    fn classify_event_for_workload_single_policy_ignores_workload_id() {
+        let policy = sample_policy();
+        let policies = vec![policy.clone()];
+        let mut event = sample_event();
+        event.workload_id = Some(String::from("any-workload"));
+
+        let result = classify_event_for_workload(&event, &policies);
+        assert_eq!(result, classify_event(&event, &policy));
+        assert_eq!(result.classification, EventClassification::Acceptable);
     }
 
     #[test]
