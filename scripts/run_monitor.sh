@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MONITOR_BIN="${MONITOR_BIN:-$ROOT/target/debug/runtime-monitor}"
+MONITOR_BIN="${MONITOR_BIN:-$ROOT/target/release/runtime-monitor}"
 COLLECTOR_CONFIG="${COLLECTOR_CONFIG:-$ROOT/policies/fastapi-monitor-policy.json}"
 SUDO="${SUDO:-sudo}"
 

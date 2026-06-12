@@ -28,3 +28,4 @@ __pycache__/
 logs/integration/
 logs/experiments/
 .codex
+report
