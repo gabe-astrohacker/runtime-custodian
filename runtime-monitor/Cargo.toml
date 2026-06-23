@@ -39,6 +39,13 @@ serde = { version = "1", default-features = false, features = ["std"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 sha2 = { version = "0.10", default-features = false }
 
+# Kept in sync with the repo-root workspace manifest (the duplicate inner
+# workspace is on the cleanup backlog); whichever is used as the build root, the
+# timed userspace binaries get full optimisation.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+
 [profile.release.package.runtime-monitor-ebpf]
 debug = 2
 codegen-units = 1
