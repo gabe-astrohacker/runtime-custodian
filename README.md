@@ -60,6 +60,8 @@ scripts/                           # ~19 scripts (build, workload, smoke tests, 
   run_concurrent_{fastapi,binwalk}_performance_experiments.py  # concurrent throughput
   run_security_experiments.py      # detection + tamper-evidence experiments
   run_verifier_scalability_experiments.py       # verifier replay cost
+  run_tpm_cost_experiments.py      # policy-triggered vs extend-everything PCR-extend cost
+  gen_binwalk_samples.py           # deterministic multi-format binwalk fixtures
 
 logs/
   integration/                     # correctness-test logs/evidence/configs
@@ -282,10 +284,22 @@ Binwalk is included as a process-heavy real-world command-line workload. The
 container stays idle while the monitor is attached, then each trial executes a
 fixed Binwalk command inside the container.
 
+The committed `bzip2.bin` / `yaffs2.bin` / `zip.bin` fixtures each hold a single
+format. For a heavier, more representative run — and reproducible provenance —
+generate a larger multi-format firmware-like image; under `binwalk -e` each
+embedded format (gzip, bzip2, xz, zip, tar, cpio, plus a nested gzip-in-zip)
+spawns its own extractor process, which is the exec/fork stream the monitor
+attests:
+
+```bash
+# Deterministic; writes samples/firmware-composite.bin (gitignored).
+./scripts/gen_binwalk_samples.py --size-mib 8
+```
+
 ```bash
 sudo -v
 ./scripts/run_binwalk_performance_experiments.py \
-  --input zip.bin \
+  --input samples/firmware-composite.bin \
   --trials 5 \
   --binwalk-args "-e --run-as=root"
 ```
