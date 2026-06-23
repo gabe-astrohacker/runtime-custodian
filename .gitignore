@@ -29,3 +29,8 @@ logs/integration/
 logs/experiments/
 .codex
 report
+
+# Generated binwalk test samples (reproduce with scripts/gen_binwalk_samples.py)
+samples/
+slides**
+reports
