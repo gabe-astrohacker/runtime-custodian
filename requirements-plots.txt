@@ -1,0 +1,4 @@
+# Plotting-only dependency for the evaluation figures (scripts/plot_*.py).
+# Kept separate from the experiment harnesses and the Rust workspace, which have
+# no third-party Python dependencies. Install with:  pip install -r requirements-plots.txt
+matplotlib>=3.7
