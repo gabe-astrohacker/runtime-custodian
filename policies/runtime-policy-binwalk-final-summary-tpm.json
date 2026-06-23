@@ -1,0 +1,37 @@
+{
+  "workload_id": "binwalk",
+  "profile_mode": "process-heavy-behaviour",
+  "acceptable": {
+    "exec_paths": [
+      "/usr/bin/binwalk",
+      "/usr/bin/sh",
+      "/usr/bin/unzip",
+      "/usr/bin/gzip",
+      "/usr/bin/bzip2",
+      "/usr/bin/tar",
+      "/usr/bin/cpio",
+      "/usr/bin/rm",
+      "/usr/bin/mkdir",
+      "/usr/bin/locale-check",
+      "/usr/bin/mesg"
+    ],
+    "event_types": [
+      "fork"
+    ]
+  },
+  "suspicious": {
+    "unknown_exec_path": true
+  },
+  "denied": {
+    "exec_paths": [],
+    "comm_names": []
+  },
+  "attestation": {
+    "backend": "tpm",
+    "mode": "final-summary",
+    "runtime_pcr": 23,
+    "hash_bank": "sha256",
+    "extend_on": [],
+    "fail_on_tpm_error": true
+  }
+}
