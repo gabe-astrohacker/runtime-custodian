@@ -77,6 +77,9 @@ class ConcurrentBinwalkConfig:
     modes: tuple[str, ...]
     output_dir: Path
     verifier_policy: Path
+    runtime_policy: Path | None
+    tpm_tcti: str | None
+    ring_buffer_bytes: int | None
     capture_argv: bool
     verify_scoped: bool
     verify_host_wide: bool
@@ -162,6 +165,25 @@ def parse_args() -> argparse.Namespace:
         "--verifier-policy",
         default="policies/binwalk-verifier-policy.json",
         help="runtime verifier policy used for monitored evidence",
+    )
+    parser.add_argument(
+        "--runtime-policy",
+        default=None,
+        help="override the monitor's runtime policy base (e.g. a TPM-backed policy); "
+        "workload_id is rewritten per run. Default: same as --verifier-policy",
+    )
+    parser.add_argument(
+        "--tpm-tcti",
+        default=None,
+        help="TPM2TOOLS_TCTI injected into the collector config so the monitor's "
+        "forked tpm2-tools reach a TPM (e.g. swtpm:host=127.0.0.1,port=2321)",
+    )
+    parser.add_argument(
+        "--ring-bytes",
+        type=int,
+        default=None,
+        help="override the eBPF EVENTS ring-buffer byte size (default 256 KiB); a "
+        "large value (e.g. 67108864) trades dropped events for finalisation lag",
     )
     parser.add_argument(
         "--capture-argv",
@@ -401,6 +423,7 @@ class ConcurrentBinwalkExperimentRunner:
             "binwalk": batch_result,
             "evidence": evidence_summary,
             "verifier": verifier_result,
+            "monitor_drain_secs": self.monitor.last_drain_secs,
         }
 
     def measure_binwalk_batch(self, mode: str, trial: int) -> dict[str, Any]:
@@ -512,7 +535,7 @@ class ConcurrentBinwalkExperimentRunner:
 
     def write_runtime_policy(self, paths: CasePaths) -> Path:
         return write_runtime_policy(
-            self.config.verifier_policy,
+            self.config.runtime_policy or self.config.verifier_policy,
             paths,
             [target.workload_id for target in self.targets],
         )
@@ -533,6 +556,8 @@ class ConcurrentBinwalkExperimentRunner:
             collection_mode=collection_mode,
             runtime_policy=runtime_policy,
             capture_argv=self.config.capture_argv,
+            tpm_tcti=self.config.tpm_tcti,
+            ring_buffer_bytes=self.config.ring_buffer_bytes,
         )
 
     def clean_case(self, paths: CasePaths) -> None:
@@ -753,6 +778,9 @@ def config_from_args(args: argparse.Namespace, settings: Settings) -> Concurrent
         modes=tuple(args.mode or ("baseline", "scoped", "host-wide")),
         output_dir=output_dir,
         verifier_policy=resolve_path(settings.root, args.verifier_policy),
+        runtime_policy=resolve_path(settings.root, args.runtime_policy) if args.runtime_policy else None,
+        tpm_tcti=args.tpm_tcti,
+        ring_buffer_bytes=args.ring_bytes,
         capture_argv=args.capture_argv,
         verify_scoped=not args.skip_verify,
         verify_host_wide=args.verify_host_wide,

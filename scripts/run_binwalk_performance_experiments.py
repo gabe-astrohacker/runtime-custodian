@@ -64,6 +64,8 @@ class BinwalkConfig:
     compose_file: Path
     project_dir: Path
     verifier_policy: Path
+    runtime_policy: Path | None
+    tpm_tcti: str | None
     capture_argv: bool
     verify_scoped: bool
     allow_binwalk_failure: bool
@@ -119,6 +121,18 @@ def parse_args() -> argparse.Namespace:
         "--verifier-policy",
         default="policies/binwalk-verifier-policy.json",
         help="runtime verifier policy used for scoped Binwalk evidence",
+    )
+    parser.add_argument(
+        "--runtime-policy",
+        default=None,
+        help="override the monitor's runtime policy (e.g. a TPM-backed policy); "
+        "default: same as --verifier-policy",
+    )
+    parser.add_argument(
+        "--tpm-tcti",
+        default=None,
+        help="TPM2TOOLS_TCTI injected into the collector config so the monitor's "
+        "forked tpm2-tools reach a TPM (e.g. swtpm:host=127.0.0.1,port=2321)",
     )
     parser.add_argument(
         "--capture-argv",
@@ -417,9 +431,13 @@ class BinwalkExperimentRunner:
             "collection_mode": collection_mode,
             "evidence_out": str(paths.evidence),
             "summary_out": str(paths.summary),
-            "runtime_policy": str(self.config.verifier_policy),
+            "runtime_policy": str(self.config.runtime_policy or self.config.verifier_policy),
             "capture_argv": self.config.capture_argv,
         }
+        if self.config.tpm_tcti:
+            # The monitor forks tpm2-tools and reads the TCTI from this field
+            # (main.rs -> TpmConfig.tcti), so swtpm is reachable without sudo -E.
+            config["tpm_tcti"] = self.config.tpm_tcti
         paths.collector_config.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n")
 
     def clean_case(self, paths: CasePaths) -> None:
@@ -577,6 +595,8 @@ def config_from_args(args: argparse.Namespace, settings: Settings) -> BinwalkCon
         compose_file=resolve_path(settings.root, args.compose_file),
         project_dir=resolve_path(settings.root, args.project_dir),
         verifier_policy=resolve_path(settings.root, args.verifier_policy),
+        runtime_policy=resolve_path(settings.root, args.runtime_policy) if args.runtime_policy else None,
+        tpm_tcti=args.tpm_tcti,
         capture_argv=args.capture_argv,
         verify_scoped=not args.skip_verify,
         allow_binwalk_failure=args.allow_binwalk_failure,

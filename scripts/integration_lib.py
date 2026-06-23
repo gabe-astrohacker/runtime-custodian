@@ -814,6 +814,8 @@ def write_multi_workload_collector_config(
     collection_mode: str,
     runtime_policy: Path,
     capture_argv: bool,
+    tpm_tcti: str | None = None,
+    ring_buffer_bytes: int | None = None,
 ) -> None:
     config = {
         "workloads": [
@@ -826,6 +828,15 @@ def write_multi_workload_collector_config(
         "runtime_policy": str(runtime_policy),
         "capture_argv": capture_argv,
     }
+    if tpm_tcti:
+        # The monitor forks tpm2-tools and reads the TCTI from this field
+        # (main.rs -> TpmConfig.tcti), so swtpm is reachable without sudo -E.
+        config["tpm_tcti"] = tpm_tcti
+    if ring_buffer_bytes:
+        # Override the eBPF EVENTS ring-buffer size (default 256 KiB). A larger
+        # buffer absorbs bursts that would otherwise drop, at the cost of monitor
+        # finalisation lag (the buffering experiment). Survives sudo via config.
+        config["ring_buffer_bytes"] = ring_buffer_bytes
     paths.collector_config.write_text(
         json.dumps(config, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
@@ -931,6 +942,10 @@ class MonitorController:
         self.proc: subprocess.Popen[str] | None = None
         self.log_handle: TextIO | None = None
         self.log_path: Path | None = None
+        # Seconds from stop-signal to monitor exit = the shutdown drain time
+        # (how long the monitor took to process its remaining buffered events and
+        # finalise). The buffering experiment reads this as the attestation lag.
+        self.last_drain_secs: float | None = None
 
     def start(self, paths: CasePaths) -> float:
         if self.proc is not None:
@@ -980,9 +995,15 @@ class MonitorController:
         self.proc = None
 
         if proc.poll() is None:
+            # SIGINT triggers graceful shutdown: the monitor drains its remaining
+            # buffered events (extends and all) before finalising. A large ring
+            # buffer can make that drain long, so the wait is configurable via
+            # MONITOR_STOP_TIMEOUT_SECS (default 30s) before escalating.
+            wait_secs = float(os.environ.get("MONITOR_STOP_TIMEOUT_SECS", "30"))
+            started = time.perf_counter()
             self.kill_process_group(proc.pid, "INT")
             try:
-                proc.wait(timeout=10)
+                proc.wait(timeout=wait_secs)
             except subprocess.TimeoutExpired:
                 self.kill_process_group(proc.pid, "TERM")
                 try:
@@ -990,6 +1011,7 @@ class MonitorController:
                 except subprocess.TimeoutExpired:
                     self.kill_process_group(proc.pid, "KILL")
                     proc.wait(timeout=5)
+            self.last_drain_secs = time.perf_counter() - started
 
         if self.log_handle is not None:
             self.log_handle.close()

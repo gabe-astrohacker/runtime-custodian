@@ -59,6 +59,7 @@ from integration_lib import (
     resolve_path,
     run_verifier_cli,
     write_evidence_lines,
+    write_runtime_policy,
 )
 
 # Decisions that mean "the verifier accepted this evidence as authentic".
@@ -531,7 +532,20 @@ def run_detection_experiment(settings: Settings, work_dir: Path) -> dict[str, An
             log(f"== detection case {case.name}: {case.note} ==")
             paths = harness.case_paths(f"security_detection_{case.name}", log_dir=work_dir)
             harness.clean_case(paths)
-            harness.write_case_collector_config(paths, overrides={"collection_mode": "scoped"})
+            # Wire the monitor to the SAME policy the verifier checks against. Without this
+            # the monitor loads its default (empty) policy, so its classification and
+            # policy_hash disagree with the verifier and every run is invalid-evidence
+            # rather than the intended accept/reject. (Mirrors the binwalk harness.)
+            runtime_policy_path = write_runtime_policy(
+                settings.verifier_policy, paths, ("fastapi-echo",)
+            )
+            harness.write_case_collector_config(
+                paths,
+                overrides={
+                    "collection_mode": "scoped",
+                    "runtime_policy": str(runtime_policy_path),
+                },
+            )
             harness.monitor.start(paths)
             try:
                 for path in case.http_paths:

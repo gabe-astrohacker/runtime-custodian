@@ -83,6 +83,10 @@ class ConcurrentFastApiConfig:
     modes: tuple[str, ...]
     output_dir: Path
     verifier_policy: Path
+    runtime_policy: Path | None
+    tpm_tcti: str | None
+    target_rps: float
+    ring_buffer_bytes: int | None
     capture_argv: bool
     verify_scoped: bool
     verify_host_wide: bool
@@ -169,6 +173,33 @@ def parse_args() -> argparse.Namespace:
         "--verifier-policy",
         default="policies/fastapi-verifier-policy.json",
         help="runtime verifier policy used for monitored evidence",
+    )
+    parser.add_argument(
+        "--runtime-policy",
+        default=None,
+        help="override the monitor's runtime policy base (e.g. a TPM-backed policy); "
+        "workload_id is rewritten per run. Default: same as --verifier-policy",
+    )
+    parser.add_argument(
+        "--tpm-tcti",
+        default=None,
+        help="TPM2TOOLS_TCTI injected into the collector config so the monitor's "
+        "forked tpm2-tools reach a TPM (e.g. swtpm:host=127.0.0.1,port=2321)",
+    )
+    parser.add_argument(
+        "--target-rps",
+        type=float,
+        default=0.0,
+        help="open-loop offered request rate (aggregate req/s); 0 = closed-loop "
+        "flat-out. With /echo each request is one exec event, so this is the "
+        "offered extend rate the monitor must keep up with.",
+    )
+    parser.add_argument(
+        "--ring-bytes",
+        type=int,
+        default=None,
+        help="override the eBPF EVENTS ring-buffer byte size (default 256 KiB); a "
+        "large value (e.g. 67108864) trades dropped events for finalisation lag",
     )
     parser.add_argument(
         "--capture-argv",
@@ -427,6 +458,7 @@ class ConcurrentFastApiExperimentRunner:
             "http": http_result,
             "evidence": evidence_summary,
             "verifier": verifier_result,
+            "monitor_drain_secs": self.monitor.last_drain_secs,
         }
 
     def measure_http(self) -> dict[str, Any]:
@@ -453,20 +485,34 @@ class ConcurrentFastApiExperimentRunner:
         results = self.run_http_batch(measured_urls, collect_latencies=True)
         total_wall_ms = (time.perf_counter_ns() - wall_start_ns) / 1_000_000
 
-        latencies = [float(item["latency_ms"]) for item in results]
+        ok = [item for item in results if item.get("error") is None]
+        errors = [item for item in results if item.get("error") is not None]
+        error_rate = (len(errors) / len(results)) if results else 0.0
+        if error_rate > self.config.max_error_rate:
+            sample = errors[0]["error"] if errors else "?"
+            fail(
+                f"request error rate {error_rate:.1%} exceeds --max-error-rate "
+                f"{self.config.max_error_rate:.1%} ({len(errors)}/{len(results)} failed); e.g. {sample}"
+            )
+
+        latencies = [float(item["latency_ms"]) for item in ok]
         per_target: dict[str, list[float]] = collections.defaultdict(list)
-        for item in results:
+        for item in ok:
             per_target[str(item["target"])].append(float(item["latency_ms"]))
 
         summary = summarise_latencies(latencies)
         summary.update(
             {
                 "total_requests": len(results),
+                "successful_requests": len(ok),
+                "error_count": len(errors),
+                "error_rate": error_rate,
                 "requests_per_container": self.config.requests_per_container,
                 "container_count": len(self.targets),
                 "concurrency": self.config.concurrency,
+                "target_rps": self.config.target_rps,
                 "total_wall_ms": total_wall_ms,
-                "throughput_rps": 0.0 if total_wall_ms == 0 else len(results) / (total_wall_ms / 1000.0),
+                "throughput_rps": 0.0 if total_wall_ms == 0 else len(ok) / (total_wall_ms / 1000.0),
                 "per_target": {
                     target: summarise_latencies(values) for target, values in sorted(per_target.items())
                 },
@@ -488,20 +534,34 @@ class ConcurrentFastApiExperimentRunner:
         def worker(item: str | tuple[str, str]) -> dict[str, Any]:
             target, url = normalise(item)
             start_ns = time.perf_counter_ns()
-            fetch_url(url, timeout_secs=self.config.http_timeout_secs)
+            try:
+                fetch_url(url, timeout_secs=self.config.http_timeout_secs)
+            except IntegrationFailure as exc:
+                # Tolerate per-request failures; measure_http aggregates them
+                # against --max-error-rate. Pushing the monitor to where it (or
+                # the service) degrades is the point — one reset must not abort.
+                return {"target": target, "url": url, "latency_ms": None, "error": str(exc)}
             elapsed_ms = (time.perf_counter_ns() - start_ns) / 1_000_000
-            return {"target": target, "url": url, "latency_ms": elapsed_ms}
+            return {"target": target, "url": url, "latency_ms": elapsed_ms, "error": None}
+
+        # Open-loop pacing: when --target-rps is set, submit requests at a fixed
+        # aggregate rate (so the offered exec/extend rate is controlled) rather
+        # than flat-out. Pacing applies to the measured batch only, not warmup.
+        interval = 1.0 / self.config.target_rps if (self.config.target_rps > 0 and collect_latencies) else 0.0
 
         results: list[dict[str, Any]] = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=self.config.concurrency) as executor:
-            future_to_item = {executor.submit(worker, item): item for item in items}
+            future_to_item: dict[Any, Any] = {}
+            next_send = time.perf_counter()
+            for item in items:
+                if interval:
+                    now = time.perf_counter()
+                    if next_send > now:
+                        time.sleep(next_send - now)
+                    next_send += interval
+                future_to_item[executor.submit(worker, item)] = item
             for future in concurrent.futures.as_completed(future_to_item):
-                item = future_to_item[future]
-                try:
-                    result = future.result()
-                except Exception as exc:  # noqa: BLE001 - surface target URL in failure message.
-                    _, url = normalise(item)
-                    fail(f"HTTP request failed for {url}: {exc}")
+                result = future.result()  # worker never raises; errors are in result["error"]
                 if collect_latencies:
                     results.append(result)
         return results
@@ -519,7 +579,7 @@ class ConcurrentFastApiExperimentRunner:
 
     def write_runtime_policy(self, paths: CasePaths) -> Path:
         return write_runtime_policy(
-            self.config.verifier_policy,
+            self.config.runtime_policy or self.config.verifier_policy,
             paths,
             [target.workload_id for target in self.targets],
         )
@@ -540,6 +600,8 @@ class ConcurrentFastApiExperimentRunner:
             collection_mode=collection_mode,
             runtime_policy=runtime_policy,
             capture_argv=self.config.capture_argv,
+            tpm_tcti=self.config.tpm_tcti,
+            ring_buffer_bytes=self.config.ring_buffer_bytes,
         )
 
     def clean_case(self, paths: CasePaths) -> None:
@@ -568,7 +630,11 @@ def fetch_url(url: str, *, timeout_secs: float) -> bytes:
     try:
         with urllib.request.urlopen(url, timeout=timeout_secs) as response:
             return response.read()
-    except urllib.error.URLError as exc:
+    except OSError as exc:
+        # Catch OSError, not just urllib.error.URLError: during a container's
+        # startup window docker-proxy accepts then RESETs connections, raising a
+        # raw ConnectionResetError (an OSError, not a URLError) that would
+        # otherwise escape wait_for_workloads' retry loop and crash the run.
         raise IntegrationFailure(str(exc)) from exc
 
 
@@ -770,6 +836,10 @@ def config_from_args(args: argparse.Namespace, settings: Settings) -> Concurrent
         modes=tuple(args.mode or ("baseline", "scoped", "host-wide")),
         output_dir=output_dir,
         verifier_policy=resolve_path(settings.root, args.verifier_policy),
+        runtime_policy=resolve_path(settings.root, args.runtime_policy) if args.runtime_policy else None,
+        tpm_tcti=args.tpm_tcti,
+        target_rps=args.target_rps,
+        ring_buffer_bytes=args.ring_bytes,
         capture_argv=args.capture_argv,
         verify_scoped=not args.skip_verify,
         verify_host_wide=args.verify_host_wide,
