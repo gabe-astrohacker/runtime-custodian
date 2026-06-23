@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 use anyhow::{Result, anyhow};
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Output};
 
@@ -59,6 +60,13 @@ impl TpmCommandRunner for SystemTpmCommandRunner {
         for (key, value) in envs {
             command.env(key, value);
         }
+        // Run each TPM tool in its own process group so a shutdown signal sent to
+        // the monitor's process group (e.g. SIGINT to stop the collector) cannot
+        // kill an in-flight `tpm2_pcrextend`. Otherwise a teardown that lands
+        // mid-extend surfaces as a spurious TPM failure and, under the correct
+        // fail-closed policy (`fail_on_tpm_error=true`), aborts finalisation. A
+        // PCR extend must complete atomically with respect to monitor shutdown.
+        command.process_group(0);
         command.output().map_err(|error| {
             if error.kind() == std::io::ErrorKind::NotFound {
                 anyhow!("TPM tool `{program}` is not available")
