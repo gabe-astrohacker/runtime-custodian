@@ -119,6 +119,9 @@ struct SingleCollectorConfig {
     tpm_quote_out_dir: Option<String>,
     #[serde(default)]
     capture_argv: bool,
+    /// Override the EVENTS ring-buffer byte size (default 256 KiB). Used by the
+    /// buffering/contention experiments; must be a power of two and page-aligned.
+    ring_buffer_bytes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -140,6 +143,9 @@ struct MultiCollectorConfig {
     tpm_quote_out_dir: Option<String>,
     #[serde(default)]
     capture_argv: bool,
+    /// Override the EVENTS ring-buffer byte size (default 256 KiB). Used by the
+    /// buffering/contention experiments; must be a power of two and page-aligned.
+    ring_buffer_bytes: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -251,6 +257,13 @@ impl CollectorConfig {
         match self {
             Self::Single(config) => config.capture_argv,
             Self::Multi(config) => config.capture_argv,
+        }
+    }
+
+    fn ring_buffer_bytes(&self) -> Option<u32> {
+        match self {
+            Self::Single(config) => config.ring_buffer_bytes,
+            Self::Multi(config) => config.ring_buffer_bytes,
         }
     }
 }
@@ -451,7 +464,12 @@ impl EvidenceCapture {
         };
         self.write_record(&EvidenceRecord::RuntimeEvent(evidence.clone()))?;
 
-        println!(
+        // Per-event diagnostic at debug level (not stdout): the `log` macros skip
+        // formatting entirely when the level is disabled, so the default
+        // (quiet) path adds no per-event lock/format/write — which previously
+        // inflated the measured monitoring overhead. Enable with
+        // `RUST_LOG=runtime_monitor=debug` for an interactive event stream.
+        debug!(
             "{:?} seq={} workload={} index={} pid={} comm={} exe_path={} classification={:?}",
             evidence.event.event_type,
             evidence.seq_no,
@@ -1456,10 +1474,22 @@ async fn main() -> Result<()> {
         debug!("remove limit on locked memory failed, ret is: {ret}");
     }
 
-    let mut ebpf = Ebpf::load(include_bytes_aligned!(concat!(
+    // The EVENTS ring buffer defaults to 256 KiB (declared in the eBPF program);
+    // the collector config can override it (e.g. for buffering experiments that
+    // trade dropped events for finalisation lag). Resized at load time.
+    const DEFAULT_RING_BYTES: u32 = 256 * 1024;
+    let ring_bytes = collector_config
+        .ring_buffer_bytes()
+        .unwrap_or(DEFAULT_RING_BYTES);
+    let mut ebpf_loader = aya::EbpfLoader::new();
+    ebpf_loader.map_max_entries("EVENTS", ring_bytes);
+    let mut ebpf = ebpf_loader.load(include_bytes_aligned!(concat!(
         env!("OUT_DIR"),
         "/runtime-monitor"
     )))?;
+    if ring_bytes != DEFAULT_RING_BYTES {
+        info!("EVENTS ring buffer overridden to {ring_bytes} bytes via collector config");
+    }
 
     populate_target_cgroups(&mut ebpf, &collector_config)?;
     set_collection_mode(&mut ebpf, collection_mode)?;
