@@ -6,11 +6,14 @@ use std::process::{Command, Output};
 use runtime_monitor_common::evidence::{RUNTIME_SUMMARY_SCHEMA_VERSION, RuntimeEvidenceState};
 use runtime_monitor_common::{
     EventClassification, EvidenceEvent, EvidenceRecord, EvidenceSyntheticRecord, RuntimeEvent,
-    RuntimePolicy, RuntimeSummary, SyntheticRecordType, classified_tpm_digest, classify_event,
+    RuntimePolicy, RuntimeSummary, SyntheticRecordType, classified_tpm_digest,
     classify_event_for_workload, combined_policy_hash, event_hash, final_summary_digest,
-    hex_decode_32, hex_encode, load_evidence_records, load_json, policy_hash, record_session_id,
+    hex_decode_32, hex_encode, load_evidence_records, load_json, record_session_id,
     replay_pcr_extend, session_start_digest, synthetic_record_hash, write_json_pretty,
 };
+
+#[cfg(test)]
+use runtime_monitor_common::{classify_event, policy_hash};
 
 const SUPPORTED_TPM_ATTESTATION_MODES: &[&str] = &["final-summary", "policy-triggered"];
 

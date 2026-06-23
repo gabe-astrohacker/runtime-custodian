@@ -20,9 +20,12 @@ use runtime_monitor_common::{
     EvidenceSyntheticRecord, MonitorState, RuntimeEvent, RuntimePolicy, RuntimeSummary,
     SyntheticRecordType, TargetWorkload, TpmQuoteSummary, TpmSummary, UNKNOWN_WORKLOAD_INDEX,
     classified_tpm_digest, classify_event_for_workload, combined_policy_hash, event_hash,
-    final_summary_digest, generate_session_id, hex_encode, policy_hash, session_start_digest,
+    final_summary_digest, generate_session_id, hex_encode, session_start_digest,
     synthetic_record_hash,
 };
+
+#[cfg(test)]
+use runtime_monitor_common::policy_hash;
 
 mod tpm;
 
@@ -307,6 +310,7 @@ struct EvidenceCapture {
 }
 
 impl EvidenceCapture {
+    #[allow(dead_code)]
     fn new(
         evidence_out: PathBuf,
         summary_out: PathBuf,
